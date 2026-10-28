@@ -285,6 +285,30 @@ psycopg2-binary
 
 All configuration is managed through `config/config.yml` and can be edited via the built-in Configuration Editor (GUI). The editor provides a tabbed interface with validation and a search bar for quickly finding tabs and sections.
 
+### Dataset sources and prompt aliases
+
+The **Datasets** tab lets you add multiple local or Hugging Face sources, import
+their column names, and assign aliases such as `person_name`. Use the resulting
+`{{ds:person_name}}` placeholder in configured prompt fields. The GUI displays
+names and mappings only. A scrollable column picker defaults to **All**; hiding
+columns preserves their aliases.
+
+Each generation job takes one row from each enabled mapped source and retains
+those values through turns, cleanup, API duplication, retries, and restart.
+Dataset settings are frozen for the run. Recovery uses saved original inputs and
+bindings; it checks source continuity before allocating additional rows.
+
+CSV, TSV, JSON, and JSONL use the normal installation. Hugging Face, saved HF
+datasets, and Parquet require Python 3.9+ and the optional installation:
+
+```bash
+python -m pip install -r requirements-datasets.txt
+```
+
+See [dataset setup, prompt boundaries, recovery behavior, and validation](docs/dataset-bindings.md)
+for examples and current limitations. A saved dataset run requires matching source
+and alias settings; **Force Recovery** does not bypass those ownership checks.
+
 ### API Setup
 
 The application supports **6 API slots**:

@@ -8,8 +8,11 @@ so this module never imports generate.py: the dependency is one-way (generate.py
 """
 import hashlib
 import json
+import os
+from contextlib import nullcontext
 import random
 import requests
+import tempfile
 import time
 import tkinter as tk
 
@@ -18,6 +21,8 @@ import app_state
 import detection
 import text_utils
 import quality
+from dataset_bindings import DatasetBindingError
+from dataset_templates import DatasetTemplateError, render_template
 from queue import Queue, Empty, Full
 from logging_config import log_message, LOG_FILE_PATH
 from api_handler import (
@@ -36,6 +41,28 @@ def update_live_prompt_preview(messages_list, metadata=None):
     hook = app_state.live_prompt_preview_hook
     if hook:
         hook(messages_list, metadata)
+
+
+def _render_authored_prompt(template, dataset_values=None, native_values=None):
+    """Render an original authored fragment, never a completed message/history.
+
+    Without a dataset binding, retain the legacy ordered replacement behavior.
+    With a binding, native and dataset values are inserted in one pass and remain
+    opaque even when their text contains either placeholder syntax.
+    """
+    if dataset_values is None:
+        for name, value in (native_values or {}).items():
+            template = template.replace("{" + name + "}", value)
+        return template
+    return render_template(template, dataset_values, native_values)
+
+
+def _preflight_dataset_templates(dataset_values, templates):
+    """Validate original template references before this task spends an API call."""
+    if dataset_values is not None:
+        for template in templates:
+            if isinstance(template, str):
+                render_template(template, dataset_values)
 
 
 def sanitize_payload_for_endpoint(payload_dict, api_url, slot_idx):
@@ -148,7 +175,7 @@ def requeue_task(q, task, task_id):
 OPENING_TASK_FILE = "opening"
 
 
-def enqueue_opening_tasks(count):
+def enqueue_opening_tasks(count, dataset_runtime=None):
     """Queue `count` opening-mode tasks that have no book chunk: ("opening_{i}", "opening", i, "", "").
 
     Tasks already in completed_task_ids are skipped but still counted, as the chunk loop counts
@@ -161,6 +188,9 @@ def enqueue_opening_tasks(count):
         if task_id in app_state.completed_task_ids:
             continue
         task_tuple = (task_id, OPENING_TASK_FILE, i, "", "")
+        if dataset_runtime is not None:
+            task_tuple = dataset_runtime.add_task(task_tuple)
+            task_id = task_tuple[0]
         app_state.task_queue.put(task_tuple)
         with app_state.task_queue_ui_lock:
             app_state.pending_task_ids.add(task_id)
@@ -222,57 +252,114 @@ def opening_mode_mismatch(saved_snapshot, current_opening_mode):
     return None
 
 
-def save_generation_state():
-    """Saves the current generation state to a JSON file for potential recovery."""
+def save_generation_state(required=False, expected_queue=None):
+    """Atomically save recovery state; required startup checkpoints fail loudly.
+
+    Dataset catalogs and immutable per-task value files are persisted by the
+    runtime. This file stores only its small descriptor and the current queue
+    status. No source is reopened or sampled while saving. Delayed callbacks can
+    supply their original queue to avoid replacing a newer run's checkpoint.
+    """
     global api_response_times_per_slot
 
-    with app_state.state_file_lock: # Ensure thread-safe file writing
+    with app_state.state_file_lock: # Serialize capture and replacement, not just file writes.
+        temporary_path = None
         try:
-            state_data = {
-                'completed_task_ids': list(app_state.completed_task_ids), # Convert set to list for JSON
-                'system_prompt_counter': app_state.system_prompt_counter,
-                'question_history': app_state.question_history,
-                'total_attempts_global': app_state.total_attempts_global,
-                'refusal_count_total': app_state.refusal_count_total,
-                'user_speaking_count_total': app_state.user_speaking_count_total,
-                'slop_count_total': app_state.slop_count_total,
-                'error_count_total': app_state.error_count_total,
-                'refusal_counts_per_api': app_state.refusal_counts_per_api,
-                'total_input_tokens': app_state.total_input_tokens,
-                'total_output_tokens': app_state.total_output_tokens,
-                'estimated_cost': estimated_cost,
-                'user_speaking_counts_per_api': app_state.user_speaking_counts_per_api,
-                'slop_counts_per_api': app_state.slop_counts_per_api,
-                'error_counts_per_api': app_state.error_counts_per_api,
-                'total_attempts_per_api': app_state.total_attempts_per_api,
-                'anti_slop_count_total': app_state.anti_slop_count_total,
-                'anti_slop_counts_per_api': anti_slop_counts_per_api,
-                'character_counter': app_state.character_counter,
-                # Snapshot of critical config settings at the time of saving state
-                'config_snapshot': {
+            if expected_queue is not None and app_state.task_queue is not expected_queue:
+                raise RuntimeError("Cannot save generation state for a queue that is no longer current.")
+            if getattr(app_state, 'clearing_job', False):
+                raise RuntimeError("Cannot save generation state while the current job is being cleared.")
+            if getattr(app_state, 'checkpoint_restore_blocked', False):
+                raise RuntimeError("The existing checkpoint could not be restored; reset explicitly before replacing it.")
+            runtime = getattr(app_state, 'dataset_runtime', None)
+            if runtime is not None:
+                dataset_descriptor = runtime.snapshot()
+                config_snapshot = dict(runtime.run_config)
+            else:
+                dataset_descriptor = None
+                config_snapshot = {
                     'prompts.use_questions_file': global_config.get('prompts.use_questions_file'),
                     'generation.num_turns': global_config.get('generation.num_turns', 1),
                     'generation.subject_size': global_config.get('generation.subject_size', 1000),
                     'generation.context_size': global_config.get('generation.context_size', 3000),
                     'api.master_duplication_mode': global_config.get('api.master_duplication_mode', False),
                     'prompts.opening_mode': bool(global_config.get('prompts.opening_mode', False)),
-                },
-                'quality_scores': {k: v for k, v in app_state.quality_scores.items()},
+                }
+            with app_state.question_history_lock:
+                question_history = list(app_state.question_history)
+            with app_state.quality_lock:
+                quality_scores = dict(app_state.quality_scores)
+            state_data = {
+                'completed_task_ids': list(app_state.completed_task_ids), # Convert set to list for JSON
+                'system_prompt_counter': app_state.system_prompt_counter,
+                'question_history': question_history,
+                'total_attempts_global': app_state.total_attempts_global,
+                'refusal_count_total': app_state.refusal_count_total,
+                'user_speaking_count_total': app_state.user_speaking_count_total,
+                'slop_count_total': app_state.slop_count_total,
+                'error_count_total': app_state.error_count_total,
+                'refusal_counts_per_api': dict(app_state.refusal_counts_per_api),
+                'total_input_tokens': app_state.total_input_tokens,
+                'total_output_tokens': app_state.total_output_tokens,
+                'estimated_cost': app_state.estimated_cost,
+                'user_speaking_counts_per_api': dict(app_state.user_speaking_counts_per_api),
+                'slop_counts_per_api': dict(app_state.slop_counts_per_api),
+                'error_counts_per_api': dict(app_state.error_counts_per_api),
+                'total_attempts_per_api': dict(app_state.total_attempts_per_api),
+                'anti_slop_count_total': app_state.anti_slop_count_total,
+                'anti_slop_counts_per_api': dict(app_state.anti_slop_counts_per_api),
+                'character_counter': app_state.character_counter,
+                'config_snapshot': config_snapshot,
+                'quality_scores': quality_scores,
             }
+            if dataset_descriptor is not None:
+                state_data['dataset_run'] = dataset_descriptor
+                with app_state.task_queue_ui_lock:
+                    state_data['completed_task_ids'] = list(app_state.completed_task_ids)
+                    state_data['pending_task_ids'] = list(app_state.pending_task_ids)
+                    state_data['failed_task_ids'] = list(app_state.failed_task_ids)
+                    state_data['purged_task_ids'] = list(app_state.purged_task_ids)
+                    state_data['task_retry_metadata'] = {
+                        task_id: details.get('retries', 0)
+                        for task_id, details in app_state.task_metadata.items()
+                    }
+                with app_state.task_retry_lock:
+                    state_data['task_retry_counts'] = dict(app_state.task_retry_counts)
             # If in master duplication mode and task queue has per-API progress, save it
             # Also save overall progress if not in duplication mode
-            if app_state.task_queue:
-                if global_config.get('api.master_duplication_mode', False) and hasattr(app_state.task_queue, 'api_processed_tasks'):
-                    state_data['api_processed_tasks_snapshot'] = dict(app_state.task_queue.api_processed_tasks)
-                elif not global_config.get('api.master_duplication_mode', False) and hasattr(app_state.task_queue, 'processed_tasks'):
-                    state_data['processed_tasks_snapshot'] = app_state.task_queue.processed_tasks
+            queue = app_state.task_queue
+            if queue:
+                with getattr(queue, 'processed_tasks_lock', None) or nullcontext():
+                    if config_snapshot.get('api.master_duplication_mode', False) and hasattr(queue, 'api_processed_tasks'):
+                        state_data['api_processed_tasks_snapshot'] = dict(queue.api_processed_tasks)
+                    elif not config_snapshot.get('api.master_duplication_mode', False) and hasattr(queue, 'processed_tasks'):
+                        state_data['processed_tasks_snapshot'] = queue.processed_tasks
 
 
-            with open(STATE_FILE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(state_data, f, indent=4)
+            target = os.path.abspath(STATE_FILE_PATH)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                                             dir=os.path.dirname(target),
+                                             prefix='.generation-state-', suffix='.tmp', delete=False) as f:
+                temporary_path = f.name
+                json.dump(state_data, f, indent=4, allow_nan=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, target)
+            temporary_path = None
             log_message("Generation state saved.", "INFO")
+            return True
         except Exception as e:
             log_message(f"Error saving generation state: {e}", "ERROR")
+            if required:
+                raise RuntimeError("Could not save required generation checkpoint: {}".format(e)) from e
+            return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
 
 def update_question_history(question, current_history_size):
@@ -488,6 +575,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
            greeting_context_local="",
            first_line_styles_local=(),
            persona_breakthrough_turn_local=2,
+           dataset_runtime_local=None,
            ):
     """
     The main function executed by each worker thread.
@@ -529,10 +617,15 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
         try:
             task = q.get(timeout=0.05) # Fetch a task from the queue with a short timeout
         except Empty:
-            # If queue is empty and all tasks have been added, and processing_active is false (e.g. due to stop signal)
-            if q.empty() and getattr(q, 'all_tasks_queued', False) and not app_state.processing_active:
-                log_message(f"Thread {thread_id}: Queue empty, all tasks queued, processing not active. Exiting.", "DEBUG")
-                break 
+            # An empty queue can still have tasks in flight that may requeue.
+            # Once every queued task is acknowledged, workers can finish without
+            # waiting for the GUI monitor to clear processing_active first.
+            if getattr(q, 'all_tasks_queued', False):
+                with q.all_tasks_done:
+                    all_done = q.unfinished_tasks == 0
+                if all_done:
+                    log_message(f"Thread {thread_id}: All queued tasks finished. Exiting.", "DEBUG")
+                    break
             continue # Continue to next iteration if queue is temporarily empty
 
         log_message(f"Thread {thread_id}: pause_processing={app_state.pause_processing}, stop_processing={app_state.stop_processing}", "DEBUG")
@@ -569,6 +662,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
         raw_subject_content_for_debug = ""
         raw_context_content_for_debug = ""
         turns_counted_this_attempt = 0            # Progress turns this attempt added (non-duplication mode)
+        dataset_dup_written = set()              # Successful (API slot, turn) outputs for this attempt
         start_time_task_overall = time.time() # For timing the whole task processing
 
         with output_data_lock:
@@ -611,6 +705,27 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
         try:
             if app_state.stop_processing: q.task_done(); continue # Check again before intensive processing
 
+            dataset_values = None
+            dataset_prompt_kwargs = {}
+            if dataset_runtime_local is not None:
+                # The runtime durably commits this task's original rows before
+                # returning; retries and other workers obtain the same binding.
+                dataset_values = dataset_runtime_local.bind_task(task).values
+                dataset_prompt_kwargs = {"dataset_values": dataset_values}
+                authored_templates = [current_answer_prompt]
+                authored_templates.extend(current_jailbreaks)
+                authored_templates.extend(current_speaking_fixes)
+                authored_templates.extend(current_slop_fixes_fallback)
+                authored_templates.extend(current_slop_fixes_for_rotation_worker)
+                if current_num_turns > 1 and current_user_continuation_prompt:
+                    authored_templates.append(current_user_continuation_prompt)
+                if not opening_mode_local and not use_questions_file_local:
+                    authored_templates.append(current_question_prompt)
+                if opening_mode_local:
+                    authored_templates.append(first_line_prompt_local)
+                    authored_templates.extend(first_line_styles_local or DEFAULT_FIRST_LINE_STYLES)
+                _preflight_dataset_templates(dataset_values, authored_templates)
+
             # Determine system prompt for this task
             current_system_prompt_for_task = ""
 
@@ -627,14 +742,19 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                 current_system_prompt_for_task = "You are a helpful assistant."
                 log_message(f"Thread {thread_id}: Using fallback system prompt for task {task_id}", "DEBUG")
 
+            current_system_prompt_for_task = _render_authored_prompt(
+                current_system_prompt_for_task, dataset_values)
+
             # --- NEW: Prepend Top Level System Prompt ---
             if current_top_level_system_prompt:
-                current_system_prompt_for_task = current_top_level_system_prompt + "\n\n" + current_system_prompt_for_task
+                task_top_level_prompt = _render_authored_prompt(current_top_level_system_prompt, dataset_values)
+                current_system_prompt_for_task = task_top_level_prompt + "\n\n" + current_system_prompt_for_task
                 log_message(f"Thread {thread_id}: Prepending Top Level System Prompt for task {task_id}", "DEBUG")
 
             # --- NEW: Inject Lore ---
             if current_lore:
-                current_system_prompt_for_task = current_system_prompt_for_task.rstrip() + "\n\n--- WORLD LORE ---\n" + current_lore + "\n--- END WORLD LORE ---\n"
+                task_lore = _render_authored_prompt(current_lore, dataset_values)
+                current_system_prompt_for_task = current_system_prompt_for_task.rstrip() + "\n\n--- WORLD LORE ---\n" + task_lore + "\n--- END WORLD LORE ---\n"
                 log_message(f"Thread {thread_id}: Injected lore ({len(current_lore)} chars) for task {task_id}", "DEBUG")
 
             character_injection = ""
@@ -669,12 +789,20 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                     character_profiles = []
 
                     for idx, selected_char in enumerate(selected_chars):
+                        if dataset_values is not None:
+                            # ConfigLoader returns shared dictionaries. Render a
+                            # task-local copy, never the shared character list.
+                            selected_char = {
+                                key: _render_authored_prompt(value, dataset_values)
+                                if isinstance(value, str) else value
+                                for key, value in selected_char.items()
+                            }
                         # EXPLICIT NAME VALIDATION: Get name, strip whitespace, check if empty
                         character_name = selected_char.get('name', '').strip()
 
                         # If random names is enabled, override with a random name from the list
                         if enable_random_names_local and random_names_list_local:
-                            random_name = random.choice(random_names_list_local)
+                            random_name = _render_authored_prompt(random.choice(random_names_list_local), dataset_values)
                             log_message(f"Thread {thread_id}: Using random name '{random_name}' for character {idx+1}", "DEBUG")
                         else:
                             random_name = character_name
@@ -770,7 +898,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
             emotional_arc_turn_states = []  # one state name per assistant turn (1-based index-0)
             arc_stages = ()
             if enable_emotional_states_local and emotional_states_list_local:
-                chosen_entry = str(random.choice(emotional_states_list_local)).strip()
+                chosen_entry = _render_authored_prompt(str(random.choice(emotional_states_list_local)), dataset_values).strip()
                 current_emotional_state_label = chosen_entry
                 arc_stages = _split_emotional_arc_entry(chosen_entry)
                 if not arc_stages:
@@ -869,6 +997,9 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                 if profile_greeting:
                     greeting_text = profile_greeting # Used as-is: no request, no checks, no chunk
                 else:
+                    _preflight_dataset_templates(dataset_values, [greeting_prompt_local] +
+                                                 ([greeting_context_local or DEFAULT_GREETING_CONTEXT]
+                                                  if len(task) > 4 and task[4] else []))
                     # The greeting IS slot 1 of the scene, so it gets the arc's start state but stays
                     # outward-behaviour-only on persona (breakthrough defaults to the next slot).
                     greeting_text = generate_greeting(
@@ -882,6 +1013,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                         user_speaking_phrases_local=current_user_speaking_phrases,
                         no_user_impersonation_local=no_user_impersonation_local,
                         context_template=greeting_context_local,
+                        **dataset_prompt_kwargs,
                     )
                     if app_state.stop_processing: q.task_done(); continue
                 if greeting_text:
@@ -893,6 +1025,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                         current_max_attempts, current_api_request_timeout, file_name=file_name,
                         refusal_phrases_local=current_refusal_phrases, slop_phrases_local=current_slop_phrases,
                         styles=first_line_styles_local,
+                        **dataset_prompt_kwargs,
                     )
                     if app_state.stop_processing: q.task_done(); continue
                 if not greeting_text or not initial_user_question:
@@ -935,10 +1068,13 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                     file_name=file_name,
                     refusal_phrases_local=current_refusal_phrases,
                     slop_phrases_local=current_slop_phrases,
+                    **dataset_prompt_kwargs,
                 )
             
             if not initial_user_question:
                 log_message(f"Thread {thread_id}: Failed to generate initial question for task {task_id}. Skipping.", "ERROR")
+                if dataset_runtime_local is not None:
+                    _requeue_or_fail(q, task, task_id, thread_id, "no initial question")
                 q.task_done(); continue
 
             current_llm_conversation_context.append({"role": "user", "content": initial_user_question})
@@ -996,6 +1132,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                                 api_request_timeout_param=current_api_request_timeout,
                                 file_name=file_name,
                                 slop_to_anti_slop_fallback=current_slop_to_anti_slop_fallback,
+                                **dataset_prompt_kwargs,
                             )
                             if answer_result and answer_result[0]:  # Check if answer is not None
                                 duplicated_answer_text = answer_result[0]
@@ -1090,7 +1227,9 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                                                     has_greeting=has_greeting,
                                                     num_characters=len(opening_chars),
                                                     quality_result=primary_turn_quality_result,
-                                                    include_metadata=include_metadata_local)                
+                                                    include_metadata=include_metadata_local)
+                                    if dataset_runtime_local is not None:
+                                        dataset_dup_written.add((original_slot_idx_for_file, turn_num + 1))
                 else: # --- Non-Duplication Mode: Single API call for answer ---
                     if app_state.stop_processing or app_state.pause_processing: break
                     start_time_api_task = time.time()
@@ -1121,6 +1260,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                         api_request_timeout_param=current_api_request_timeout,
                         slop_to_anti_slop_fallback=current_slop_to_anti_slop_fallback,
                         file_name=file_name,
+                        **dataset_prompt_kwargs,
                     )
                     if answer_result and answer_result[0]:  # Check if answer is not None
                         assistant_answer = answer_result[0]
@@ -1208,6 +1348,7 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                     file_name=file_name,
                     refusal_phrases_local=current_refusal_phrases,
                     slop_phrases_local=current_slop_phrases,
+                    **dataset_prompt_kwargs,
                 )
 
                 if not user_continuation_reply:
@@ -1223,6 +1364,27 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
             if app_state.stop_processing: q.task_done(); continue 
 
             # --- Write Completed Conversation (Non-Duplication Mode) or Mark Task Complete (Duplication Mode) ---
+            if master_duplication_enabled_local and dataset_runtime_local is not None:
+                expected_outputs = {
+                    (slot, turn) for slot, api in enumerate(all_api_configs_local[:4])
+                    if api.get('enabled', False) for turn in range(1, current_num_turns + 1)
+                }
+                complete = bool(expected_outputs) and dataset_dup_written == expected_outputs
+                with output_data_lock:
+                    with app_state.task_queue_ui_lock:
+                        app_state.pending_task_ids.discard(task_id)
+                        if complete:
+                            app_state.completed_task_ids.add(task_id)
+                            app_state.failed_task_ids.discard(task_id)
+                        else:
+                            # Some per-API rows may already have been written. Do
+                            # not silently replay the whole task automatically.
+                            app_state.failed_task_ids.add(task_id)
+                if not complete:
+                    log_message("Thread {}: Dataset duplication task {} has partial output; "
+                                "marked failed for deliberate retry with its original rows.".format(
+                                    thread_id, task_id), "WARNING")
+                save_generation_state(expected_queue=q)
             if not master_duplication_enabled_local:
                 # In non-duplication mode, conversation_history_for_output contains the full conversation.
                 # Ensure at least one Q/A pair; an opening conversation needs one reply after greeting and first line
@@ -1288,19 +1450,25 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                                         num_characters=len(opening_chars),
                                         quality_result=final_quality_result,
                                         include_metadata=include_metadata_local)
-                                    app_state.completed_task_ids.add(task_id)
+                                    if dataset_runtime_local is not None:
+                                        with app_state.task_queue_ui_lock:
+                                            app_state.completed_task_ids.add(task_id)
+                                            app_state.pending_task_ids.discard(task_id)
+                                            app_state.failed_task_ids.discard(task_id)
+                                    else:
+                                        app_state.completed_task_ids.add(task_id)
                                     log_message(f"Thread {thread_id}: Task {task_id} marked complete ({actual_messages}/{expected_messages} messages)", "INFO")
                                 else:
                                     log_message(f"Thread {thread_id}: Task {task_id} already marked complete, skipping", "DEBUG")
                             # Update UI tracking on success
                             with app_state.task_queue_ui_lock:
                                 app_state.pending_task_ids.discard(task_id)
-                            save_generation_state()
+                            save_generation_state(expected_queue=q)
                         else:
                             log_message(f"Thread {thread_id}: Task {task_id} incomplete. Expected {expected_messages} messages, got {actual_messages}. NOT saving to output.jsonl.", "WARNING")
                             # Do NOT add to completed_task_ids - this task should be retried.
                             # Opening mode marks a task failed once its requeues run out, so it stays retryable
-                            if has_greeting:
+                            if has_greeting or dataset_runtime_local is not None:
                                 _requeue_or_fail(q, task, task_id, thread_id,
                                                  f"incomplete, {actual_messages}/{expected_messages} messages")
                             # If the host is down, requeue it so it's retried once the host recovers
@@ -1324,6 +1492,21 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
                             app_state.pending_task_ids.discard(task_id)
                             app_state.failed_task_ids.add(task_id)
 
+        except (DatasetBindingError, DatasetTemplateError) as e:
+            # These failures cannot be repaired by selecting another row or
+            # retrying an HTTP call. Keep any existing binding for a deliberate
+            # retry. Exhaustion blocks new allocations but must not interrupt
+            # already-bound tasks running on other workers.
+            with app_state.task_queue_ui_lock:
+                app_state.pending_task_ids.discard(task_id)
+                app_state.failed_task_ids.add(task_id)
+            with app_state.stats_lock:
+                app_state.error_count_total += 1
+                if len(app_state.recent_errors_total) >= MAX_RECENT:
+                    app_state.recent_errors_total.pop(0)
+                app_state.recent_errors_total.append(("T{} Dataset: {}".format(thread_id, str(e)[:100]), -1))
+            log_message("Thread {}: Dataset task {} failed before further requests: {}".format(
+                thread_id, task_id, e), "ERROR")
         except Exception as e: # Catch-all for errors during task processing
             error_message_gen = f"Thread {thread_id}: Error processing task {task_id} from {file_name}: {str(e)}"
             log_message(error_message_gen, "ERROR")
@@ -1358,6 +1541,10 @@ def worker(thread_id, q, output_data_lock, use_questions_file_local,
 
         q.task_done() # Signal that this task is complete
 
+    if dataset_runtime_local is not None and getattr(app_state, 'dataset_runtime', None) is dataset_runtime_local:
+        # Failures before a first answer and exhausted automatic retries also
+        # need a final status checkpoint. A replacement run owns its own saver.
+        save_generation_state(expected_queue=q)
     log_message(f"Thread {thread_id} completed its run.", "INFO")
 
 
@@ -1380,8 +1567,10 @@ def generate_question(system_prompt, question_prompt_template, subject, context,
                       history_size_local_param,
                       raw_subject_chunk, raw_context_chunk,
                       api_slot_idx, current_max_attempts_param, api_request_timeout_param,
-                      file_name="", refusal_phrases_local=(), slop_phrases_local=()):
+                      file_name="", refusal_phrases_local=(), slop_phrases_local=(), dataset_values=None):
     """Generates an initial question using the LLM, with retries for API call failures."""
+
+    _preflight_dataset_templates(dataset_values, [question_prompt_template])
 
     if not api_url_local:
         log_message(f"Thread {thread_id}: API URL missing for question generation (API Slot {api_slot_idx+1}). Cannot proceed.", "ERROR")
@@ -1418,9 +1607,11 @@ def generate_question(system_prompt, question_prompt_template, subject, context,
                 recent_questions_str = "None"
 
             # Format the question prompt with placeholders
-            final_formatted_user_prompt = question_prompt_template.replace("{recent_questions}", recent_questions_str)
-            final_formatted_user_prompt = final_formatted_user_prompt.replace("{subject}", subject if subject else "N/A")
-            final_formatted_user_prompt = final_formatted_user_prompt.replace("{context}", context if context else "N/A")
+            final_formatted_user_prompt = _render_authored_prompt(
+                question_prompt_template, dataset_values,
+                {"recent_questions": recent_questions_str,
+                 "subject": subject if subject else "N/A",
+                 "context": context if context else "N/A"})
 
             messages_for_llm = [
                 {"role": "system", "content": system_prompt},
@@ -1676,9 +1867,10 @@ def generate_question(system_prompt, question_prompt_template, subject, context,
 def generate_user_continuation(system_prompt, conversation_history_for_llm, user_continuation_prompt_template,
                                thread_id, sampler_settings_local, api_url_local, model_name_local, api_key_local,
                                api_slot_idx, current_max_attempts_param, api_request_timeout_param,
-                               file_name="", refusal_phrases_local=(), slop_phrases_local=()):
+                               file_name="", refusal_phrases_local=(), slop_phrases_local=(), dataset_values=None):
     """Generates the user's continuation reply, with retries for API call failures."""
 
+    _preflight_dataset_templates(dataset_values, [user_continuation_prompt_template])
 
     if not api_url_local:
         log_message(f"Thread {thread_id}: API URL missing for user continuation (API Slot {api_slot_idx+1}). Cannot proceed.", "ERROR")
@@ -1703,7 +1895,9 @@ def generate_user_continuation(system_prompt, conversation_history_for_llm, user
             if conversation_history_for_llm and conversation_history_for_llm[-1]["role"] == "assistant":
                 last_assistant_message = conversation_history_for_llm[-1]["content"]
 
-            final_user_continuation_prompt = user_continuation_prompt_template.replace("{last_assistant_message}", last_assistant_message)
+            final_user_continuation_prompt = _render_authored_prompt(
+                user_continuation_prompt_template, dataset_values,
+                {"last_assistant_message": last_assistant_message})
 
             messages = [{"role": "system", "content": system_prompt}] + \
                        conversation_history_for_llm + \
@@ -2108,18 +2302,22 @@ def _request_opening_message(messages, max_tokens_key, log_type, preview_type, c
     return None
 
 
-def fill_greeting_prompt(greeting_prompt_template, speaker, chunk_text="", context_template=""):
+def fill_greeting_prompt(greeting_prompt_template, speaker, chunk_text="", context_template="", dataset_values=None):
     """Fill {speaker} and {context}. With a book chunk, {context} is the context template (default
     DEFAULT_GREETING_CONTEXT) with the chunk in {chunk}; without one, {context} is empty."""
-    context_block = (context_template or DEFAULT_GREETING_CONTEXT).replace("{chunk}", chunk_text) if chunk_text else ""
-    return greeting_prompt_template.replace("{speaker}", speaker).replace("{context}", context_block).rstrip()
+    context_block = _render_authored_prompt(
+        context_template or DEFAULT_GREETING_CONTEXT, dataset_values,
+        {"chunk": chunk_text}) if chunk_text else ""
+    return _render_authored_prompt(greeting_prompt_template, dataset_values,
+                                   {"speaker": speaker, "context": context_block}).rstrip()
 
 
 def generate_greeting(scene_prompt, greeting_prompt_template, speaker, chunk_text, thread_id,
                       sampler_settings_local, api_url_local, model_name_local, api_key_local,
                       api_slot_idx, current_max_attempts_param, api_request_timeout_param,
                       file_name="", refusal_phrases_local=(), slop_phrases_local=(),
-                      user_speaking_phrases_local=(), no_user_impersonation_local=False, context_template=""):
+                      user_speaking_phrases_local=(), no_user_impersonation_local=False, context_template="",
+                      dataset_values=None):
     """Write the character's opening message: [system: scene prompt, user: filled greeting prompt].
 
     Uses max_tokens_answer and the user-speaking check, as an answer does. The book chunk, when the
@@ -2127,7 +2325,8 @@ def generate_greeting(scene_prompt, greeting_prompt_template, speaker, chunk_tex
     """
     messages = [
         {"role": "system", "content": scene_prompt},
-        {"role": "user", "content": fill_greeting_prompt(greeting_prompt_template, speaker, chunk_text, context_template)},
+        {"role": "user", "content": fill_greeting_prompt(greeting_prompt_template, speaker, chunk_text,
+                                                            context_template, dataset_values=dataset_values)},
     ]
     return _request_opening_message(
         messages, 'max_tokens_answer', 'greeting_request', 'Greeting', True,
@@ -2139,16 +2338,17 @@ def generate_greeting(scene_prompt, greeting_prompt_template, speaker, chunk_tex
 def generate_first_line(greeting, first_line_prompt_template, thread_id,
                         sampler_settings_local, api_url_local, model_name_local, api_key_local,
                         api_slot_idx, current_max_attempts_param, api_request_timeout_param,
-                        file_name="", refusal_phrases_local=(), slop_phrases_local=(), styles=()):
+                        file_name="", refusal_phrases_local=(), slop_phrases_local=(), styles=(), dataset_values=None):
     """Write the user's first line from the user's seat: [system: first-line prompt, user: greeting].
 
     The scene prompt is not sent; the greeting is the other party's turn. One style from `styles`
     (default DEFAULT_FIRST_LINE_STYLES) fills {style}. Uses max_tokens_user_reply and no user-speaking check
     (the line is the user's). Returns the line, or None.
     """
-    style = random.choice(tuple(styles) or DEFAULT_FIRST_LINE_STYLES)
+    style = _render_authored_prompt(random.choice(tuple(styles) or DEFAULT_FIRST_LINE_STYLES), dataset_values)
     messages = [
-        {"role": "system", "content": first_line_prompt_template.replace("{style}", style)},
+        {"role": "system", "content": _render_authored_prompt(first_line_prompt_template, dataset_values,
+                                                                {"style": style})},
         {"role": "user", "content": greeting},
     ]
     return _request_opening_message(
@@ -2682,7 +2882,7 @@ def generate_answer_with_retries(base_system_prompt, conversation_history_for_ll
                                  no_user_impersonation_local,
                                  api_request_timeout_param,
                                  slop_to_anti_slop_fallback=False,
-                                 file_name=""):
+                                 file_name="", dataset_values=None):
     """
     Generates an assistant's answer, handling retries for refusals, user speaking, and slop.
     Applies jailbreaks, speaking fixes, and slop fixes (system prompt or dedicated LLM).
@@ -2692,6 +2892,16 @@ def generate_answer_with_retries(base_system_prompt, conversation_history_for_ll
     refusal_detected_this_main_api_call = False
     issue_ever_detected_this_task = False
     refusal_ever_detected_this_task = False
+
+    # Only these arguments are authored templates. The base scene, history,
+    # detected phrases, and text passed to dedicated fixers are already literal.
+    answer_prompt_for_task = _render_authored_prompt(answer_prompt_template, dataset_values)
+    if dataset_values is not None:
+        jailbreaks_local = tuple(_render_authored_prompt(text, dataset_values) for text in jailbreaks_local)
+        speaking_fixes_local = tuple(_render_authored_prompt(text, dataset_values) for text in speaking_fixes_local)
+        slop_fixes_fallback_local = tuple(_render_authored_prompt(text, dataset_values) for text in slop_fixes_fallback_local)
+        current_slop_fixes_for_rotation_param = tuple(
+            _render_authored_prompt(text, dataset_values) for text in current_slop_fixes_for_rotation_param)
 
     if not api_url_local:
         log_message(f"Thread {thread_id}: API URL missing for answer generation (API Slot {api_slot_idx+1}). Cannot proceed.", "ERROR")
@@ -2732,7 +2942,7 @@ def generate_answer_with_retries(base_system_prompt, conversation_history_for_ll
 
                 messages = [{"role": "system", "content": current_system_prompt_iter}] + \
                            conversation_history_for_llm + \
-                           [{"role": "user", "content": answer_prompt_template}]
+                           [{"role": "user", "content": answer_prompt_for_task}]
 
                 # --- LIVE PREVIEW HOOK ---
                 update_live_prompt_preview(messages, {

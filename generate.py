@@ -32,6 +32,7 @@ import yaml
 import re
 import zipfile  # For backing up output files
 import shutil  # For file operations
+from copy import deepcopy
 import text_utils
 import detection
 from config_loader import ConfigLoader, sanitize_input
@@ -50,6 +51,7 @@ from app_state import (
     global_config, API_CIRCUIT_BREAKER, api_circuit_breaker_lock, task_retry_counts, task_retry_lock, BASE_DEBUG_LOG_PATH, BASE_OUTPUT_FILE_PATH, MAX_RECENT, MAX_TASK_REQUEUES, STATE_FILE_PATH, OUTPUT_DIR, INPUT_DIR, anti_slop_counts_per_api, estimated_cost,
 )
 from config_editor import ConfigEditor
+from dataset_runtime import DatasetRun, has_active_sources
 from ui_layout import fit_window, ScrollableFrame, ResponsiveGrid, NotebookNavigator, wrap_label
 matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -155,30 +157,179 @@ class ToastManager:
 
 # --- Crash Recovery Functions ---
 
+class GenerationStateRestoreError(RuntimeError):
+    """A saved run cannot safely resume; leave its checkpoint intact."""
+
+
+def _parse_dataset_job_tracking(runtime, state_data):
+    """Validate job state without changing the currently installed run."""
+    tasks = tuple(runtime.tasks)
+    task_ids = {task[0] for task in tasks}
+    if len(task_ids) != len(tasks):
+        raise GenerationStateRestoreError("The saved dataset catalog contains duplicate job IDs.")
+
+    def saved_ids(key):
+        values = state_data.get(key, [])
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise GenerationStateRestoreError("Invalid saved {}.".format(key))
+        result = set(values)
+        if not result.issubset(task_ids):
+            raise GenerationStateRestoreError("Saved {} references jobs outside its dataset run.".format(key))
+        return result
+
+    completed = saved_ids('completed_task_ids')
+    if not completed.issubset(runtime.bound_task_ids):
+        raise GenerationStateRestoreError("A completed dataset job has no saved row binding.")
+    # A state snapshot can race the worker's removal from the pending UI set.
+    # The catalog and terminal states are authoritative, not that pending list.
+    saved_ids('pending_task_ids')
+    purged = saved_ids('purged_task_ids') - completed
+    failed = saved_ids('failed_task_ids') - completed - purged
+
+    def saved_counts(key):
+        values = state_data.get(key, {})
+        if not isinstance(values, dict):
+            raise GenerationStateRestoreError("Invalid saved {}.".format(key))
+        if any(key not in task_ids or type(value) is not int or value < 0
+               for key, value in values.items()):
+            raise GenerationStateRestoreError("Invalid saved {} job counts.".format(key))
+        return dict(values)
+
+    retry_counts = saved_counts('task_retry_counts')
+    retry_metadata = saved_counts('task_retry_metadata')
+    return {
+        'completed_task_ids': completed,
+        'purged_task_ids': purged,
+        'failed_task_ids': failed,
+        'pending_task_ids': task_ids - completed - purged - failed,
+        'task_metadata': {
+            task[0]: {'file': task[1], 'retries': retry_metadata.get(task[0], 0),
+                      'task_data': tuple(task)}
+            for task in tasks
+        },
+        'retry_counts': retry_counts,
+    }
+
+
+def _install_dataset_job_tracking(tracking):
+    """Install a fully validated job-state snapshot after all parsing succeeds."""
+    with app_state.task_queue_ui_lock:
+        for key in ('completed_task_ids', 'purged_task_ids', 'failed_task_ids',
+                    'pending_task_ids', 'task_metadata'):
+            setattr(app_state, key, tracking[key])
+    with task_retry_lock:
+        task_retry_counts.clear()
+        task_retry_counts.update(tracking['retry_counts'])
+
+
+def _parse_saved_statistics(state_data):
+    """Convert saved counters before any part of a recovered run is installed."""
+    def counter(key, default=0):
+        value = state_data.get(key, default)
+        if type(value) is not int or value < 0:
+            raise GenerationStateRestoreError("Invalid saved {} counter.".format(key))
+        return value
+
+    counters = {key: counter(key) for key in (
+        'system_prompt_counter', 'character_counter', 'total_attempts_global',
+        'refusal_count_total', 'user_speaking_count_total', 'slop_count_total',
+        'error_count_total', 'anti_slop_count_total', 'total_input_tokens',
+        'total_output_tokens',
+    )}
+    for key in ('refusal_counts_per_api', 'user_speaking_counts_per_api',
+                'slop_counts_per_api', 'error_counts_per_api',
+                'total_attempts_per_api', 'anti_slop_counts_per_api',
+                'api_processed_tasks_snapshot'):
+        values = state_data.get(key, {})
+        if not isinstance(values, dict):
+            raise GenerationStateRestoreError("Invalid saved {}.".format(key))
+        parsed = {i: 0 for i in range(6)}
+        for slot, value in values.items():
+            if str(slot) not in tuple(str(i) for i in range(6)) or type(value) is not int or value < 0:
+                raise GenerationStateRestoreError("Invalid saved {} slot or count.".format(key))
+            parsed[int(slot)] = value
+        counters[key] = parsed
+    counters['processed_tasks_snapshot'] = counter('processed_tasks_snapshot')
+    history = state_data.get('question_history', [])
+    if not isinstance(history, list) or any(not isinstance(item, str) for item in history):
+        raise GenerationStateRestoreError("Invalid saved question_history.")
+    quality_scores = state_data.get('quality_scores', {})
+    if not isinstance(quality_scores, dict):
+        raise GenerationStateRestoreError("Invalid saved quality_scores.")
+    cost = state_data.get('estimated_cost', 0.0)
+    if type(cost) not in (int, float) or not 0 <= cost < float('inf'):
+        raise GenerationStateRestoreError("Invalid saved estimated_cost.")
+    counters.update(question_history=list(history), quality_scores=dict(quality_scores), estimated_cost=cost)
+    return counters
+
+
+def _close_dataset_runtime(runtime):
+    if runtime is not None:
+        try:
+            runtime.close()
+        except Exception as exc:
+            log_message("Could not close dataset readers: {}".format(exc), "ERROR")
+
+
+def _discard_dataset_checkpoint(runtime):
+    """Explicit Stop/Clear owns deletion of only its captured run's sidecars."""
+    if runtime is not None:
+        try:
+            runtime.discard_checkpoint()
+        except Exception as exc:
+            log_message("Could not remove this run's dataset checkpoint: {}".format(exc), "ERROR")
+
+
+def _wait_for_worker_exit(threads):
+    """Join captured workers without dropping references after an API timeout."""
+    for thread in threads:
+        while thread.is_alive():
+            thread.join(timeout=0.2)
+
+
+def _discard_queued_tasks(queue):
+    """Drain abandoned queued entries after workers stop, balancing Queue counts."""
+    if queue is None:
+        return
+    while True:
+        try:
+            queue.get_nowait()
+        except Empty:
+            break
+        queue.task_done()
+
 def load_generation_state():
     """
     Loads a previously saved generation state from STATE_FILE_PATH.
     Prompts the user if critical configuration settings have changed since the state was saved.
-    Returns True if state was successfully loaded (and user agreed to resume if incompatible), False otherwise.
+    Returns True when loaded, False for no state or an explicitly declined legacy
+    resume. Invalid dataset checkpoints raise without deleting saved progress.
     """
     global loaded_processed_tasks_snapshot
     global api_response_times_per_slot
 
-    loaded_processed_tasks_snapshot = None # Initialize for non-duplication mode
-
-    def load_per_api_stat(stat_name, default_val_constructor):
-        """Helper to load per-API stats, converting string keys from JSON back to int"""
-        loaded_stat_str_keys = state_data.get(stat_name, {str(i): default_val_constructor() for i in range(5)})
-        return {int(k): v for k, v in loaded_stat_str_keys.items()}
-
     with app_state.state_file_lock: # Ensure thread-safe file reading
+        restored_runtime = None
         try:
             if os.path.exists(STATE_FILE_PATH):
                 with open(STATE_FILE_PATH, 'r', encoding='utf-8') as f:
                     state_data = json.load(f)
                 
+                if not isinstance(state_data, dict):
+                    raise GenerationStateRestoreError("Saved generation state must be an object.")
+                dataset_descriptor = state_data.get('dataset_run')
+                dataset_settings = deepcopy(global_config.get('datasets', {}))
+                legacy_has_work = (any(state_data.get(key) for key in (
+                    'completed_task_ids', 'pending_task_ids', 'failed_task_ids', 'purged_task_ids'))
+                    or state_data.get('total_attempts_global', 0))
+                if dataset_descriptor is None and legacy_has_work and has_active_sources(dataset_settings):
+                    raise GenerationStateRestoreError(
+                        "This saved run predates dataset job bindings. Clear the saved job before starting a dataset run.")
+
                 # Compare critical settings from saved state with current config
                 saved_config_snapshot = state_data.get('config_snapshot', {})
+                if not isinstance(saved_config_snapshot, dict):
+                    raise GenerationStateRestoreError("Invalid saved config_snapshot.")
                 current_use_questions_file = global_config.get('prompts.use_questions_file')
                 current_num_turns = global_config.get('generation.num_turns', 1)
                 current_subject_size = global_config.get('generation.subject_size', 1000)
@@ -204,6 +355,10 @@ def load_generation_state():
                         incompatible_settings.append(f"Context Size (Saved: {saved_config_snapshot.get('generation.context_size')}, Current: {current_context_size})")
                 
                 if incompatible_settings:
+                    if dataset_descriptor is not None:
+                        raise GenerationStateRestoreError(
+                            "Restore the saved run settings before resuming, or clear the job to start fresh:\n"
+                            + "\n".join(incompatible_settings))
                     msg = "The saved state seems to be from a run with different critical settings:\n" + \
                           "\n".join([f"- {s}" for s in incompatible_settings]) + \
                           "\n\nResuming might lead to unexpected behavior or reprocessing of already completed items with new settings. " + \
@@ -216,43 +371,68 @@ def load_generation_state():
                             except Exception as e_del: log_message(f"Could not remove incompatible state file: {e_del}", "ERROR")
                         return False # Do not load state
 
-                # Load state data into global variables
-                app_state.completed_task_ids = set(state_data.get('completed_task_ids', []))
-                app_state.system_prompt_counter = state_data.get('system_prompt_counter', 0)
-                app_state.quality_scores = state_data.get('quality_scores', {})
-                app_state.character_counter = state_data.get('character_counter', 0)
-                app_state.question_history = state_data.get('question_history', [])
-                
-                app_state.total_attempts_global = state_data.get('total_attempts_global', 0)
-                app_state.refusal_count_total = state_data.get('refusal_count_total', 0)
-                app_state.user_speaking_count_total = state_data.get('user_speaking_count_total', 0)
-                app_state.slop_count_total = state_data.get('slop_count_total', 0)
-                app_state.error_count_total = state_data.get('error_count_total', 0)
-                anti_slop_count_total = state_data.get('anti_slop_count_total', 0)
-                anti_slop_counts_per_api = load_per_api_stat('anti_slop_counts_per_api', lambda: 0)
+                # Parse every potentially invalid field before replacing any live state.
+                parsed_stats = _parse_saved_statistics(state_data)
+                parsed_completed = state_data.get('completed_task_ids', [])
+                if not isinstance(parsed_completed, list) or any(not isinstance(tid, str) for tid in parsed_completed):
+                    raise GenerationStateRestoreError("Invalid saved completed_task_ids.")
+                parsed_completed = set(parsed_completed)
+                parsed_tracking = None
+                if dataset_descriptor is not None:
+                    try:
+                        restored_runtime = DatasetRun.from_checkpoint(
+                            dataset_descriptor, STATE_FILE_PATH, dataset_settings)
+                        if dict(restored_runtime.run_config) != saved_config_snapshot:
+                            raise GenerationStateRestoreError(
+                                "The main checkpoint settings do not match its dataset run manifest.")
+                        parsed_tracking = _parse_dataset_job_tracking(restored_runtime, state_data)
+                    except Exception as exc:
+                        raise GenerationStateRestoreError(
+                            "Cannot restore dataset jobs: {}. Saved files have been kept.".format(exc)) from exc
 
-                app_state.refusal_counts_per_api = load_per_api_stat('refusal_counts_per_api', lambda: 0)
-                app_state.user_speaking_counts_per_api = load_per_api_stat('user_speaking_counts_per_api', lambda: 0)
-                app_state.slop_counts_per_api = load_per_api_stat('slop_counts_per_api', lambda: 0)
-                app_state.error_counts_per_api = load_per_api_stat('error_counts_per_api', lambda: 0)
-                app_state.total_attempts_per_api = load_per_api_stat('total_attempts_per_api', lambda: 0)
-
-                if current_master_duplication_mode and 'api_processed_tasks_snapshot' in state_data:
-                    # Convert string keys from JSON snapshot back to int for API indices
-                    app_state.loaded_api_processed_tasks_snapshot = {int(k): v for k, v in state_data['api_processed_tasks_snapshot'].items()}
-                elif not current_master_duplication_mode and 'processed_tasks_snapshot' in state_data:
-                    loaded_processed_tasks_snapshot = state_data['processed_tasks_snapshot']
+                # No parsing, input reads, or source allocation occurs after this point.
+                old_runtime = app_state.dataset_runtime
+                if parsed_tracking is not None:
+                    _install_dataset_job_tracking(parsed_tracking)
                 else:
-                    app_state.loaded_api_processed_tasks_snapshot = None
-                    loaded_processed_tasks_snapshot = None
-                
+                    with app_state.task_queue_ui_lock:
+                        app_state.completed_task_ids = parsed_completed
+                        app_state.pending_task_ids.clear()
+                        app_state.failed_task_ids.clear()
+                        app_state.purged_task_ids.clear()
+                        app_state.task_metadata.clear()
+                    with task_retry_lock:
+                        task_retry_counts.clear()
+                app_state.dataset_runtime = restored_runtime
+                app_state.loaded_dataset_checkpoint = deepcopy(dataset_descriptor)
+                app_state.checkpoint_restore_blocked = False
+                for key, value in parsed_stats.items():
+                    if key not in ('processed_tasks_snapshot', 'api_processed_tasks_snapshot', 'anti_slop_counts_per_api'):
+                        setattr(app_state, key, value)
+                # This mapping is imported by several modules; retain its identity.
+                anti_slop_counts_per_api.clear()
+                anti_slop_counts_per_api.update(parsed_stats['anti_slop_counts_per_api'])
+
+                app_state.loaded_api_processed_tasks_snapshot = None
+                loaded_processed_tasks_snapshot = None
+                if current_master_duplication_mode and 'api_processed_tasks_snapshot' in state_data:
+                    app_state.loaded_api_processed_tasks_snapshot = parsed_stats['api_processed_tasks_snapshot']
+                elif not current_master_duplication_mode and 'processed_tasks_snapshot' in state_data:
+                    loaded_processed_tasks_snapshot = parsed_stats['processed_tasks_snapshot']
+                _close_dataset_runtime(old_runtime)
                 log_message(f"Generation state loaded. {len(app_state.completed_task_ids)} unique tasks previously completed.", "INFO")
                 return True # State loaded successfully
             return False # State file does not exist
         except Exception as e:
-            log_message(f"Error loading generation state: {e}. Starting fresh.", "ERROR")
-            reset_all_stats_and_history() # Reset everything if loading fails
-            return False # Failed to load state
+            app_state.checkpoint_restore_blocked = True
+            if restored_runtime is not app_state.dataset_runtime:
+                _close_dataset_runtime(restored_runtime)
+            log_message(f"Error loading generation state: {e}. Saved progress was kept.", "ERROR")
+            if isinstance(e, GenerationStateRestoreError):
+                raise
+            raise GenerationStateRestoreError(
+                "Cannot read saved generation state. Clear the saved job only if you want to start fresh: {}".format(e)
+            ) from e
 # --- End of Crash Recovery Functions ---
 
 
@@ -263,7 +443,20 @@ def reset_all_stats_and_history():
     global loaded_processed_tasks_snapshot
     global api_response_times_per_slot
 
-    app_state.completed_task_ids = set()
+    if any(thread.is_alive() for thread in app_state.threads if thread):
+        raise RuntimeError("Cannot reset run state while workers are still alive.")
+    _close_dataset_runtime(app_state.dataset_runtime)
+    app_state.dataset_runtime = None
+    app_state.loaded_dataset_checkpoint = None
+    app_state.checkpoint_restore_blocked = False
+    with app_state.task_queue_ui_lock:
+        app_state.completed_task_ids = set()
+        app_state.pending_task_ids.clear()
+        app_state.failed_task_ids.clear()
+        app_state.purged_task_ids.clear()
+        app_state.task_metadata.clear()
+    with task_retry_lock:
+        task_retry_counts.clear()
     app_state.system_prompt_counter = 0
     app_state.character_counter = 0
     app_state.question_history = []
@@ -811,8 +1004,33 @@ def update_live_prompt_preview(messages_list, metadata=None):
 app_state.live_prompt_preview_hook = update_live_prompt_preview
 
 def generation_running():
-    """True while any worker thread of the current run is alive."""
-    return bool(app_state.threads) and any(t.is_alive() for t in app_state.threads if t)
+    """Block replacement until the current run and its cleanup have finished."""
+    return (app_state.processing_active or app_state.clearing_job or app_state.shutting_down
+            or any(t.is_alive() for t in app_state.threads if t))
+
+
+def _enqueue_generation_task(task, queue, dataset_runtime=None):
+    """Register an original payload once, then expose its stable ID to workers/UI."""
+    task = tuple(task)
+    if dataset_runtime is not None:
+        task = dataset_runtime.add_task(task)
+    queue.put(task)
+    with app_state.task_queue_ui_lock:
+        app_state.pending_task_ids.add(task[0])
+        app_state.task_metadata[task[0]] = {'file': task[1], 'retries': 0, 'task_data': task}
+    return task
+
+
+def _queue_restored_dataset_tasks(runtime, queue):
+    """Resume catalog payloads without opening or resampling original input files."""
+    count = 0
+    with app_state.task_queue_ui_lock:
+        pending = set(app_state.pending_task_ids)
+    for task in runtime.tasks:
+        if task[0] in pending:
+            queue.put(tuple(task))
+            count += 1
+    return count
 
 def start_processing():
     """Initiates the data generation process based on current configurations."""
@@ -827,6 +1045,13 @@ def start_processing():
 
     global_config.load() # Ensure latest config.yml is loaded
     log_message("DEBUG: start_processing() function has been called.", "INFO")
+    try:
+        dataset_settings = deepcopy(global_config.get('datasets', {}))
+        datasets_active = has_active_sources(dataset_settings)
+    except Exception as exc:
+        toast.show("Dataset configuration needs attention.", "error")
+        log_message("Cannot start dataset generation: {}".format(exc), "ERROR")
+        return
 
     # --- Initialize Valkey Connection ---
     if global_config.get('valkey.enabled', True):
@@ -883,7 +1108,13 @@ def start_processing():
 
     should_resume = False # ✅ Correctly indented (function scope)
     if os.path.exists(STATE_FILE_PATH):
-        if load_generation_state():
+        try:
+            state_loaded = load_generation_state()
+        except GenerationStateRestoreError as exc:
+            toast.show("Saved job could not be resumed; its files were kept.", "error")
+            messagebox.showerror("Resume Dataset Job", str(exc))
+            return
+        if state_loaded:
             should_resume = True
             log_message("Auto-resuming previous generation (config matched).", "INFO")
         else:
@@ -1195,8 +1426,30 @@ def start_processing():
         log_message(opening_conflict, "ERROR")
         app_state.processing_active = False; start_button.config(state=tk.NORMAL); return
 
+    dataset_resume = should_resume and app_state.dataset_runtime is not None
+    if not dataset_resume:
+        try:
+            app_state.dataset_runtime = DatasetRun(
+                dataset_settings, STATE_FILE_PATH,
+                run_config={
+                    'prompts.use_questions_file': current_use_questions_file,
+                    'generation.num_turns': current_num_turns,
+                    'generation.subject_size': subject_size_conf,
+                    'generation.context_size': context_size_conf,
+                    'api.master_duplication_mode': master_duplication_enabled,
+                    'prompts.opening_mode': current_opening_mode,
+                },
+            ) if datasets_active else None
+        except Exception as exc:
+            app_state.processing_active = False
+            start_button.config(state=tk.NORMAL)
+            toast.show("Could not initialize the dataset run.", "error")
+            log_message("Dataset run initialization failed: {}".format(exc), "ERROR")
+            return
+    dataset_runtime_for_run = app_state.dataset_runtime
+
     # --- Populate Task Queue ---
-    if current_use_questions_file:
+    if current_use_questions_file and not dataset_resume:
         try:
             app_state.questions_list = read_txt(QUESTIONS_FILE_PATH)
             if not app_state.questions_list:
@@ -1210,25 +1463,25 @@ def start_processing():
     else: 
         app_state.questions_list = [] 
 
-    input_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('.txt') and f != os.path.basename(QUESTIONS_FILE_PATH)]
-    if not current_use_questions_file and not input_files and not current_opening_mode: # Opening mode runs without a book
+    input_files = [] if dataset_resume else [f for f in os.listdir(INPUT_DIR) if f.endswith('.txt') and f != os.path.basename(QUESTIONS_FILE_PATH)]
+    if not dataset_resume and not current_use_questions_file and not input_files and not current_opening_mode: # Opening mode runs without a book
         toast.show("No input .txt files found.", "warning")
         log_message("No input .txt files found for chunking.", "WARNING")
         app_state.processing_active = False; start_button.config(state=tk.NORMAL); return
 
     total_tasks_to_queue = 0
-    if current_use_questions_file:
+    if dataset_resume:
+        total_tasks_to_queue = _queue_restored_dataset_tasks(dataset_runtime_for_run, app_state.task_queue)
+        log_message("Restored {} original dataset jobs without rereading input files.".format(total_tasks_to_queue), "INFO")
+    elif current_use_questions_file:
         for i, q_text in enumerate(app_state.questions_list):
             task_id = f"q_{i}"
             if task_id not in app_state.completed_task_ids:
                 task_tuple = (task_id, os.path.basename(QUESTIONS_FILE_PATH), i, q_text)
-                app_state.task_queue.put(task_tuple)
+                _enqueue_generation_task(task_tuple, app_state.task_queue, dataset_runtime_for_run)
                 total_tasks_to_queue += 1
-                with app_state.task_queue_ui_lock:
-                    app_state.pending_task_ids.add(task_id)
-                    app_state.task_metadata[task_id] = {'file': os.path.basename(QUESTIONS_FILE_PATH), 'retries': 0, 'task_data': task_tuple}
     elif current_opening_mode and not input_files: # Opening mode without a book: num_random_chunks tasks
-        total_tasks_to_queue = enqueue_opening_tasks(NUM_RANDOM_CHUNKS)
+        total_tasks_to_queue = enqueue_opening_tasks(NUM_RANDOM_CHUNKS, dataset_runtime=dataset_runtime_for_run)
         log_message(f"Opening mode without input files: {total_tasks_to_queue} tasks for this run.", "INFO")
     else: # Chunk input files (Randomized)
         subject_size = subject_size_conf
@@ -1304,12 +1557,9 @@ def start_processing():
 
                     # 6. Add the task to the queue
                     task_tuple = (task_id, random_file_name, random_start_index, current_subject_content, current_context_text)
-                    app_state.task_queue.put(task_tuple)
+                    _enqueue_generation_task(task_tuple, app_state.task_queue, dataset_runtime_for_run)
                     tasks_queued_count += 1
                     total_tasks_to_queue += 1
-                    with app_state.task_queue_ui_lock:
-                        app_state.pending_task_ids.add(task_id)
-                        app_state.task_metadata[task_id] = {'file': random_file_name, 'retries': 0, 'task_data': task_tuple}
                 else:
                     # Task already exists, just count it for the progress bar total
                     total_tasks_to_queue += 1
@@ -1320,6 +1570,14 @@ def start_processing():
 
         log_message(f"Attempted to queue {NUM_RANDOM_CHUNKS} random tasks. Successfully queued {tasks_queued_count} new unique tasks.", "INFO")
 
+    if dataset_resume and total_tasks_to_queue == 0:
+        toast.show("No pending jobs. Retry failed jobs or clear this run to start fresh.", "info")
+        log_message("Saved dataset run has no pending jobs; original catalog and bindings retained.", "INFO")
+        app_state.processing_active = False
+        _close_dataset_runtime(dataset_runtime_for_run)
+        start_button.config(state=tk.NORMAL)
+        update_queue_ui()
+        return
     if total_tasks_to_queue == 0 and not app_state.completed_task_ids: 
         toast.show("No tasks to process.", "warning")
         log_message("No tasks to queue.", "WARNING"); app_state.processing_active = False; start_button.config(state=tk.NORMAL); return
@@ -1330,7 +1588,8 @@ def start_processing():
     app_state.task_queue.all_tasks_queued = True 
     
     # **FIX ISSUE 1**: Adjust total_tasks_for_progress to account for turns
-    num_unique_tasks_for_run = total_tasks_to_queue + len(app_state.completed_task_ids)
+    num_unique_tasks_for_run = (len(dataset_runtime_for_run.tasks) if dataset_runtime_for_run is not None
+                                else total_tasks_to_queue + len(app_state.completed_task_ids))
     # current_num_turns is already loaded from config
     actual_total_for_progress_bars = num_unique_tasks_for_run * current_num_turns
     
@@ -1443,6 +1702,19 @@ def start_processing():
         log_message(f"Warning: No valid thread count found in API configs. Using default of {total_threads}.", "WARNING")
     
     log_message(f"Starting {total_threads} worker threads based on API configurations.", "INFO")
+
+    try:
+        if dataset_runtime_for_run is not None:
+            dataset_runtime_for_run.seal()
+        save_generation_state(required=True)
+    except Exception as exc:
+        _close_dataset_runtime(dataset_runtime_for_run)
+        app_state.processing_active = False
+        start_button.config(state=tk.NORMAL)
+        pause_button.config(state=tk.DISABLED)
+        toast.show("Could not save the job before starting generation.", "error")
+        log_message("Generation did not start because its checkpoint could not be saved: {}".format(exc), "ERROR")
+        return
     
     for i in range(total_threads):
         thread = threading.Thread(target=worker, args=(
@@ -1494,17 +1766,22 @@ def start_processing():
             'greeting_context_local': current_greeting_context,
             'first_line_styles_local': current_first_line_styles,
             'persona_breakthrough_turn_local': persona_breakthrough_turn,
+            'dataset_runtime_local': dataset_runtime_for_run,
         }, name=f"Worker-{i}")
         app_state.threads.append(thread)
         thread.start()
 
     log_message(f"Started {total_threads} worker threads.", "INFO")
+    run_queue = app_state.task_queue
+    run_threads = tuple(app_state.threads)
 
     _psutil_state = {"last_check": 0.0}
     PSUTIL_CHECK_INTERVAL = 10.0  # seconds
 
     # --- GUI Progress Update Loop ---
     def update_gui_progress():
+        if app_state.task_queue is not run_queue or app_state.shutting_down:
+            return
         if dashboard_pause_var.get():
             app_state.root.after(1000, update_gui_progress) # Check again in 1s
             return
@@ -1522,7 +1799,7 @@ def start_processing():
                         except Exception:
                             pass
                     threading.Thread(target=_check_open_files, daemon=True).start()
-                master_duplication_current = app_state.master_duplication_enabled_var.get()
+                master_duplication_current = master_duplication_enabled
 
                 if app_state.task_queue and hasattr(app_state.task_queue, 'qsize'):
                     if app_state.task_queue.qsize() > 30000:
@@ -1588,12 +1865,12 @@ def start_processing():
                     delay = 500 if (is_active and has_work) else 2000
                     app_state.root.after(delay, update_gui_progress)
         else: # Processing stopped or completed
-            start_button.config(state=tk.NORMAL)
+            start_button.config(state=tk.DISABLED if generation_running() else tk.NORMAL)
             pause_button.config(state=tk.DISABLED); pause_button.config(text="Pause")
             stop_clear_button.config(state=tk.NORMAL)
             log_message("Processing stopped/completed. GUI updates halted.", "INFO")
             update_dashboard()
-            master_duplication_final_check = app_state.master_duplication_enabled_var.get()
+            master_duplication_final_check = master_duplication_enabled
             if hasattr(app_state.task_queue, 'total_tasks_for_progress') and app_state.task_queue.total_tasks_for_progress > 0:
                 if master_duplication_final_check and hasattr(app_state.task_queue, 'api_widgets'):
                     for api_idx, widgets in app_state.task_queue.api_widgets.items():
@@ -1615,46 +1892,48 @@ def start_processing():
                         if hasattr(app_state.task_queue, 'overall_percent_label') and app_state.task_queue.overall_percent_label.winfo_exists():
                             app_state.task_queue.overall_percent_label.config(text="100%", foreground='#51cf66')
                         app_state.task_queue.overall_time_label.config(text="Time Remaining: Done!")
-            save_generation_state()
+            if not app_state.clearing_job:
+                save_generation_state(expected_queue=run_queue)
 
     if app_state.root.winfo_exists(): 
         app_state.root.after(100, update_gui_progress) # Start the GUI update loop
 
     # --- Wait for Threads Completion (in a separate thread to not block UI) ---
     def wait_for_completion():
-        for t_item in app_state.threads: 
-            if t_item.is_alive(): 
-                t_item.join() # Wait for each worker thread to finish
-
-        if app_state.task_queue: 
-            app_state.task_queue.join() # Wait for all tasks in the queue to be processed
-
+        _wait_for_worker_exit(run_threads)
+        if app_state.task_queue is not run_queue or app_state.clearing_job or app_state.shutting_down:
+            return  # Stop/Clear or Quit owns finalization of this captured run.
+        _close_dataset_runtime(dataset_runtime_for_run)
+        if app_state.task_queue is not run_queue or app_state.clearing_job or app_state.shutting_down:
+            return
+        save_generation_state(expected_queue=run_queue)
         log_message("All tasks completed or processing stopped. All threads joined.", "INFO")
-        app_state.processing_active = False 
-        
-        if not app_state.stop_processing: 
-            all_done = False 
-            master_duplication_at_end = app_state.master_duplication_enabled_var.get()
-            if hasattr(app_state.task_queue, 'total_tasks_for_progress') and app_state.task_queue.total_tasks_for_progress > 0:
-                if master_duplication_at_end and hasattr(app_state.task_queue, 'api_processed_tasks'):
-                    all_apis_finished = True
-                    for api_idx_check, api_conf_check in enumerate(all_api_configs_runtime):
-                        if api_idx_check < 4 and api_conf_check.get('enabled') and api_conf_check.get('url') and api_conf_check.get('key'):
-                            if app_state.task_queue.api_processed_tasks.get(api_idx_check, 0) < app_state.task_queue.total_tasks_for_progress:
-                                all_apis_finished = False; break
-                    if all_apis_finished : all_done = True
-                elif not master_duplication_at_end and hasattr(app_state.task_queue, 'processed_tasks'):
-                    if app_state.task_queue.processed_tasks >= app_state.task_queue.total_tasks_for_progress:
-                        all_done = True
-            elif hasattr(app_state.task_queue, 'total_tasks_for_progress') and app_state.task_queue.total_tasks_for_progress == 0: 
-                all_done = True # No tasks were queued, so technically "done"
+        app_state.processing_active = False
 
-            if app_state.root.winfo_exists(): 
-                if all_done:
-                    app_state.root.after(0, lambda: messagebox.showinfo("Processing Complete", "All tasks have been processed successfully!"))
-                else: 
-                    app_state.root.after(0, lambda: messagebox.showinfo("Processing Finished", "Processing has finished. Some tasks may not have completed fully. Check logs."))
-        # If stop_processing was true, the quit_application or stop_and_clear_job will handle messages.
+        def finish_ui():
+            if app_state.task_queue is not run_queue or app_state.clearing_job or app_state.shutting_down:
+                return
+            start_button.config(state=tk.NORMAL)
+            pause_button.config(text="Pause", state=tk.DISABLED)
+            update_queue_ui()
+            update_dashboard()
+            if app_state.stop_processing:
+                return
+            target = getattr(run_queue, 'total_tasks_for_progress', 0)
+            if master_duplication_enabled:
+                enabled_slots = [index for index, conf in enumerate(all_api_configs_runtime)
+                                 if index < 4 and conf.get('enabled') and conf.get('url')]
+                all_done = all(run_queue.api_processed_tasks.get(index, 0) >= target
+                               for index in enabled_slots)
+            else:
+                all_done = getattr(run_queue, 'processed_tasks', 0) >= target
+            if all_done:
+                messagebox.showinfo("Processing Complete", "All tasks have been processed successfully!")
+            else:
+                messagebox.showinfo("Processing Finished", "Processing has finished. Some tasks may not have completed fully. Check logs.")
+
+        if app_state.root.winfo_exists():
+            app_state.root.after(0, finish_ui)
 
     completion_thread = threading.Thread(target=wait_for_completion, name="CompletionWaiter")
     completion_thread.start()
@@ -2125,13 +2404,22 @@ def toggle_debug_logging():
 # --- Stop and Clear Job Functionality ---
 def stop_and_clear_processing_job():
     """Stops the current job, clears its progress, and resets UI for a new start."""
+    if app_state.clearing_job or app_state.shutting_down:
+        return
 
     if not app_state.processing_active and (not app_state.threads or not any(t.is_alive() for t in app_state.threads if t)):
         log_message("No active processing job to stop and clear. Resetting for fresh start.", "INFO")
-        if os.path.exists(STATE_FILE_PATH):
-            try: os.remove(STATE_FILE_PATH); log_message(f"Removed state file: {STATE_FILE_PATH}", "INFO")
-            except Exception as e: log_message(f"Error removing state file {STATE_FILE_PATH}: {e}", "WARNING")
-        reset_all_stats_and_history()
+        app_state.clearing_job = True
+        with app_state.state_file_lock:
+            _discard_dataset_checkpoint(app_state.dataset_runtime)
+            _discard_queued_tasks(app_state.task_queue)
+            app_state.task_queue = Queue()  # Invalidate scheduled callbacks from the previous run.
+            app_state.threads = []
+            if os.path.exists(STATE_FILE_PATH):
+                try: os.remove(STATE_FILE_PATH); log_message(f"Removed state file: {STATE_FILE_PATH}", "INFO")
+                except Exception as e: log_message(f"Error removing state file {STATE_FILE_PATH}: {e}", "WARNING")
+            reset_all_stats_and_history()
+        app_state.clearing_job = False
         update_dashboard()
         for widget in progress_frame.winfo_children(): widget.destroy() # Clear progress bars
         start_button.config(state=tk.NORMAL)
@@ -2143,6 +2431,7 @@ def stop_and_clear_processing_job():
 
     if messagebox.askokcancel("Stop & Clear Job", "Stop current job and clear its progress? This allows starting a new job fresh. Output files won't be deleted by this action."):
         log_message("Stop & Clear Job pressed. Initiating stop and clear.", "INFO")
+        app_state.clearing_job = True
         app_state.stop_processing = True # Signal threads to stop
 
         start_button.config(state=tk.DISABLED)
@@ -2150,48 +2439,33 @@ def stop_and_clear_processing_job():
         if 'stop_clear_button' in globals() and stop_clear_button.winfo_exists():
             stop_clear_button.config(state=tk.DISABLED)
 
-        wait_thread = threading.Thread(target=wait_for_threads_to_stop_for_clear, name="ClearJobWaiter")
+        wait_thread = threading.Thread(target=wait_for_threads_to_stop_for_clear,
+                                       args=(tuple(app_state.threads), app_state.task_queue, app_state.dataset_runtime),
+                                       name="ClearJobWaiter")
         wait_thread.start()
 
 
-def wait_for_threads_to_stop_for_clear():
+def wait_for_threads_to_stop_for_clear(run_threads, run_queue, run_runtime):
     """Helper function to join threads and clear state after stop_and_clear_job is initiated."""
-
-    if app_state.task_queue and app_state.threads: # Send sentinels to worker threads
-        active_thread_count = sum(1 for t in app_state.threads if t.is_alive())
-        num_sentinels = active_thread_count if active_thread_count > 0 else len(app_state.threads)
-        log_message(f"Stop & Clear: Attempting to stop threads by queueing {num_sentinels} sentinels.", "DEBUG")
-        for _ in range(num_sentinels):
-            try:
-                if app_state.task_queue: app_state.task_queue.put(None, block=False, timeout=0.05)
-            except Full: log_message("Stop & Clear: Queue full while putting sentinel.", "WARNING"); break
-            except Exception as e: log_message(f"Stop & Clear: Error putting sentinel: {e}", "WARNING")
-
-    if app_state.threads: # Join threads
-        log_message(f"Stop & Clear: Waiting for {len(app_state.threads)} worker threads to join...", "INFO")
-        for t in app_state.threads:
-            if t.is_alive():
-                try:
-                    t.join(timeout=1.0)
-                    if t.is_alive(): log_message(f"Stop & Clear: Thread {t.name} did not join in time.", "WARNING")
-                except Exception as e: log_message(f"Stop & Clear: Error joining thread {t.name}: {e}", "WARNING")
-        log_message("Stop & Clear: All worker threads joined or timed out.", "INFO")
-        app_state.threads = [] # Clear the list of threads
-
-    app_state.processing_active = False # Mark processing as fully stopped
-
-    if app_state.task_queue: # Clear and reinitialize the task queue
-        while not app_state.task_queue.empty():
-            try: app_state.task_queue.get_nowait()
-            except Empty: break
+    log_message("Stop & Clear: Waiting for all current requests to finish.", "INFO")
+    _wait_for_worker_exit(run_threads)
+    # Finish any snapshot already writing before removing the checkpoint.
+    with app_state.state_file_lock:
+        if app_state.task_queue is not run_queue:
+            return  # Never clear the state of a replacement run.
+        _close_dataset_runtime(run_runtime)
+        _discard_dataset_checkpoint(run_runtime)
+        _discard_queued_tasks(run_queue)
+        app_state.threads = []
+        app_state.processing_active = False
         app_state.task_queue = Queue()
-        log_message("Stop & Clear: Task queue cleared and reinitialized.", "INFO")
+        log_message("Stop & Clear: All workers stopped; task queue reinitialized.", "INFO")
 
-    if os.path.exists(STATE_FILE_PATH): # Remove the state file for a fresh start next time
-        try: os.remove(STATE_FILE_PATH); log_message(f"Stop & Clear: Removed state file: {STATE_FILE_PATH}", "INFO")
-        except Exception as e: log_message(f"Stop & Clear: Error removing state file {STATE_FILE_PATH}: {e}", "WARNING")
+        if os.path.exists(STATE_FILE_PATH): # Remove the state file for a fresh start next time
+            try: os.remove(STATE_FILE_PATH); log_message(f"Stop & Clear: Removed state file: {STATE_FILE_PATH}", "INFO")
+            except Exception as e: log_message(f"Stop & Clear: Error removing state file {STATE_FILE_PATH}: {e}", "WARNING")
 
-    reset_all_stats_and_history() # Reset all counters, completed_task_ids, etc.
+        reset_all_stats_and_history() # Reset all counters, completed_task_ids, etc.
     log_message("Stop & Clear: All statistics and in-memory progress reset.", "INFO")
 
     if app_state.root.winfo_exists(): # Schedule UI finalization on the main thread
@@ -2200,6 +2474,7 @@ def wait_for_threads_to_stop_for_clear():
 def finalize_stop_and_clear_ui():
     """Finalizes UI updates after a 'Stop & Clear Job' operation."""
     log_message("Stop & Clear: Finalizing UI updates.", "INFO")
+    app_state.clearing_job = False
     update_dashboard() # Refresh dashboard with reset stats
 
     for widget in progress_frame.winfo_children(): widget.destroy() # Clear progress bars
@@ -2223,57 +2498,42 @@ primary_actions_layout = ResponsiveGrid(button_frame,
     [start_button, pause_button, stop_clear_button, config_button],
     min_width=170, max_columns=4, pady=4)
 
-def quit_application():
-    """Handles graceful shutdown of the application when Quit button or window X is clicked."""
-    if messagebox.askokcancel("Quit", "Are you sure you want to quit? This will stop any ongoing generation and save progress."):
-        log_message("Quit button pressed. Initiating shutdown.", "INFO")
-        app_state.stop_processing = True # Signal threads to stop
+def _finish_quit_after_workers(run_threads, run_queue, run_runtime):
+    """Finish requests in the background before saving and releasing readers."""
+    _wait_for_worker_exit(run_threads)
+    if app_state.task_queue is run_queue and not app_state.clearing_job:
+        save_generation_state(expected_queue=run_queue)
+    _close_dataset_runtime(run_runtime)
+    app_state.processing_active = False
 
-        start_button.config(state=tk.DISABLED)
-        pause_button.config(state=tk.DISABLED)
-        if 'stop_clear_button' in globals() and stop_clear_button.winfo_exists():
-            stop_clear_button.config(state=tk.DISABLED)
-        quit_button.config(state=tk.DISABLED)
-
-
-        if app_state.task_queue and app_state.threads and any(t.is_alive() for t in app_state.threads):
-            active_thread_count = sum(1 for t in app_state.threads if t.is_alive())
-            num_sentinels = active_thread_count if active_thread_count > 0 else len(app_state.threads)
-            log_message(f"Quit: Attempting to stop threads by queueing {num_sentinels} sentinels.", "DEBUG")
-            for _ in range(num_sentinels):
-                try:
-                    if app_state.task_queue: app_state.task_queue.put(None, block=False, timeout=0.05)
-                except Full:
-                    log_message("Quit: Queue full while trying to put sentinel. Threads might be stuck.", "WARNING")
-                    break
-                except Exception as e:
-                    log_message(f"Quit: Error putting sentinel in queue: {e}", "WARNING")
-
-        if app_state.threads:
-            log_message(f"Quit: Waiting for {len(app_state.threads)} worker threads to join...", "INFO")
-            for t in app_state.threads:
-                if t.is_alive():
-                    try:
-                        t.join(timeout=1.0) # Short timeout for joining
-                        if t.is_alive():
-                            log_message(f"Quit: Thread {t.name} did not join in time.", "WARNING")
-                    except Exception as e:
-                        log_message(f"Quit: Error joining thread {t.name}: {e}", "WARNING")
-            log_message("Quit: All worker threads joined or timed out.", "INFO")
-
-        app_state.processing_active = False # Mark processing as fully stopped
-
-        log_message("Quit: Saving generation state before exiting...", "INFO")
-        save_generation_state() # Save final progress
-
-        log_message("Quit: Destroying Tkinter root window...", "INFO")
-        if app_state.root and hasattr(app_state.root, 'winfo_exists') and app_state.root.winfo_exists():
-            app_state.root.destroy()
+    def finish_ui():
         if app_state.db_pool:
             app_state.db_pool.closeall()
-            log_message("PostgreSQL pool closed.", "INFO")
-        log_message("Application shutdown sequence complete. Exiting process.", "INFO")
-        sys.exit(0) # Terminate the script
+        if app_state.root.winfo_exists():
+            app_state.root.destroy()
+        log_message("Application shutdown sequence complete.", "INFO")
+
+    if app_state.root.winfo_exists():
+        app_state.root.after(0, finish_ui)
+
+
+def quit_application():
+    """Keep the UI responsive until old requests have stopped and state is saved."""
+    if app_state.shutting_down:
+        return
+    if messagebox.askokcancel("Quit", "Are you sure you want to quit? This will stop any ongoing generation and save progress."):
+        log_message("Quit: Waiting for current requests before saving and closing.", "INFO")
+        app_state.shutting_down = True
+        app_state.stop_processing = True
+        start_button.config(state=tk.DISABLED)
+        pause_button.config(state=tk.DISABLED)
+        stop_clear_button.config(state=tk.DISABLED)
+        quit_button.config(state=tk.DISABLED)
+        threading.Thread(
+            target=_finish_quit_after_workers,
+            args=(tuple(app_state.threads), app_state.task_queue, app_state.dataset_runtime),
+            name="QuitJobWaiter",
+        ).start()
 
 quit_button = ttk.Button(maintenance_frame, text="❌ Quit Application", command=quit_application)
 
@@ -2284,13 +2544,18 @@ app_state.status_bar.grid(row=3, column=0, sticky="ew", padx=SPACING, pady=(0, 4
 wrap_label(app_state.status_bar, app_state.root, padding=2 * SPACING)
 
 def force_recovery():
-    """Bypasses config checks and forces state reload + thread restart."""
-    if not app_state.processing_active and not any(t.is_alive() for t in app_state.threads):
+    """Restore saved job tracking without erasing the progress just loaded."""
+    if not generation_running():
         if os.path.exists(STATE_FILE_PATH):
-            if load_generation_state():
+            try:
+                loaded = load_generation_state()
+            except GenerationStateRestoreError as exc:
+                messagebox.showerror("Recovery", str(exc))
+                return
+            if loaded:
                 log_message("Force recovery: State loaded. Ready to resume.", "INFO")
-                reset_all_stats_and_history()
                 update_dashboard()
+                update_queue_ui()
                 toast.show("State recovered. Click Start to resume.", "success")
             else:
                 toast.show("Could not load state. Check logs.", "warning")
@@ -2767,29 +3032,48 @@ def update_queue_ui():
             app_state.queue_trees['failed'].insert("", tk.END, values=(tid, m.get('file', 'N/A'), m.get('retries', 0)))
 
 def purge_queue():
+    if app_state.clearing_job or app_state.shutting_down:
+        return
     if messagebox.askyesno("Purge Queue", "Remove all pending tasks? They will be skipped by workers."):
         with app_state.task_queue_ui_lock:
             app_state.purged_task_ids.update(app_state.pending_task_ids)
             app_state.pending_task_ids.clear()
         log_message("Purged all pending tasks from UI tracking.", "INFO")
+        save_generation_state()
         update_queue_ui()
 
 def retry_failed_tasks():
+    if app_state.clearing_job or app_state.shutting_down:
+        return
     if not app_state.failed_task_ids:
         messagebox.showinfo("Info", "No failed tasks to retry.")
         return
     if messagebox.askyesno("Retry Failed", f"Retry {len(app_state.failed_task_ids)} failed tasks?"):
+        live_workers = (not app_state.stop_processing
+                        and any(thread.is_alive() for thread in app_state.threads if thread))
         with app_state.task_queue_ui_lock:
             to_retry = list(app_state.failed_task_ids)
-            app_state.failed_task_ids.clear()
+            retry_payloads = []
             for tid in to_retry:
-                app_state.pending_task_ids.add(tid)
                 meta = app_state.task_metadata.get(tid, {})
+                if 'task_data' not in meta:
+                    log_message("Cannot retry {}: its original job payload is missing.".format(tid), "ERROR")
+                    continue
+                app_state.failed_task_ids.discard(tid)
+                app_state.pending_task_ids.add(tid)
                 meta['retries'] = 0
                 app_state.task_metadata[tid] = meta
-                if 'task_data' in meta:
-                    app_state.task_queue.put(meta['task_data'])
-        log_message(f"Re-queued {len(to_retry)} failed tasks.", "INFO")
+                retry_payloads.append(tuple(meta['task_data']))
+        with task_retry_lock:
+            for task in retry_payloads:
+                task_retry_counts.pop(task[0], None)
+        if live_workers and app_state.task_queue is not None:
+            for task in retry_payloads:
+                app_state.task_queue.put(task)
+        save_generation_state()
+        if not live_workers:
+            toast.show("Failed jobs are pending. Click Start to resume their original inputs.", "info")
+        log_message(f"Marked {len(retry_payloads)} failed tasks for retry with their original payloads.", "INFO")
         update_queue_ui()
 
 def export_queue():
@@ -2877,15 +3161,12 @@ if __name__ == "__main__":
             traceback.print_exc(file=f_err)
     finally: 
         log_message("Application exiting via main finally block.", "INFO")
-        if not app_state.stop_processing: # If not already stopped (e.g., by Quit button)
-            app_state.stop_processing = True # Signal threads to stop
-            if app_state.task_queue and app_state.threads:
-                for _ in range(len(app_state.threads)): 
-                    try:
-                        if app_state.task_queue: app_state.task_queue.put(None, block=False, timeout=0.05)
-                    except: pass # Ignore errors here, best effort to stop threads
-        
+        app_state.stop_processing = True
+        app_state.shutting_down = True
+        _wait_for_worker_exit(tuple(app_state.threads))
+        app_state.processing_active = False
         log_message("Main finally block attempting to save state.", "INFO")
-        save_generation_state() # Final attempt to save state
-        time.sleep(0.1) # Brief pause to allow file operations
+        if not app_state.clearing_job:
+            save_generation_state(expected_queue=app_state.task_queue) # Final attempt after workers can no longer mutate it.
+        _close_dataset_runtime(app_state.dataset_runtime)
         log_message("Main finally block executed. Process should exit if not already via sys.exit().", "INFO")

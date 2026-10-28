@@ -10,9 +10,9 @@ are staged until every source succeeds; exhaustion or invalid data never causes
 silent cycling, skipping, or a partially published binding. The allocation lock
 is released before the caller renders prompts or makes model API requests.
 
-Task snapshots serialize actual values, not just row numbers. Their JSON format
-is a foundation for later application save/resume integration; it does not itself
-restore source cursors, pending jobs, or conversation progress.
+Task snapshots serialize actual values, not just row numbers. ``from_bindings``
+restores their registry without I/O and verifies source replay before permitting
+new allocations. Application pending jobs and conversation progress are separate.
 """
 
 import json
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
-from dataset_sources import DatasetRow, DatasetSchema, DatasetSource, SourceSpec
+from dataset_sources import DatasetRow, DatasetSchema, DatasetSource, SourceSpec, open_source
 from dataset_templates import validate_alias
 
 
@@ -241,6 +241,27 @@ class TaskBinding:
             raise DatasetBindingError("Invalid persisted task binding: {}".format(exc)) from exc
 
 
+def _validate_schema(spec: SourceSpec, schema: DatasetSchema, column_aliases: Mapping) -> SourceSpec:
+    """Validate mapped names and return the reader's resolved source identity."""
+    resolved_spec = getattr(schema, "resolved_spec", None)
+    if resolved_spec is not None:
+        resolved_spec = _copy_spec(resolved_spec)
+        if resolved_spec.source_id != spec.source_id:
+            raise DatasetBindingError("Resolved source settings must retain the configured source ID.")
+        spec = resolved_spec
+    _text_identifier(schema.fingerprint, "Source fingerprint")
+    columns = tuple(schema.columns)
+    if any(not isinstance(column, str) for column in columns) or len(set(columns)) != len(columns):
+        raise DatasetBindingError("Dataset schema must contain distinct string column names.")
+    missing = [column for column in column_aliases if column not in columns]
+    if missing:
+        raise DatasetBindingError(
+            "Source {!r} has no mapped column(s): {}."
+            .format(spec.source_id, ", ".join(repr(column) for column in missing))
+        )
+    return spec
+
+
 class _SourceCursor:
     def __init__(self, selection: SourceBinding, spec: SourceSpec, schema: DatasetSchema):
         self.source = selection.source
@@ -327,6 +348,9 @@ class DatasetBindingManager:
         self._closed = False
         self._bindings = {}  # type: Dict[str, TaskBinding]
         self._cursors = []
+        self._restore_bindings = None  # type: Optional[Tuple[TaskBinding, ...]]
+        self._source_factory = None
+        self._restore_failure = None  # type: Optional[str]
         source_ids = set()
         aliases = set()
         inspected = []
@@ -348,22 +372,7 @@ class DatasetBindingManager:
                 # cleaned up alongside previously validated readers.
                 inspected.append(selection.source)
                 schema = selection.source.schema()
-                resolved_spec = getattr(schema, "resolved_spec", None)
-                if resolved_spec is not None:
-                    resolved_spec = _copy_spec(resolved_spec)
-                    if resolved_spec.source_id != spec.source_id:
-                        raise DatasetBindingError("Resolved source settings must retain the configured source ID.")
-                    spec = resolved_spec
-                _text_identifier(schema.fingerprint, "Source fingerprint")
-                columns = tuple(schema.columns)
-                if any(not isinstance(column, str) for column in columns) or len(set(columns)) != len(columns):
-                    raise DatasetBindingError("Dataset schema must contain distinct string column names.")
-                missing = [column for column in selection.column_aliases if column not in columns]
-                if missing:
-                    raise DatasetBindingError(
-                        "Source {!r} has no mapped column(s): {}."
-                        .format(spec.source_id, ", ".join(repr(column) for column in missing))
-                    )
+                spec = _validate_schema(spec, schema, selection.column_aliases)
                 self._cursors.append(_SourceCursor(selection, spec, schema))
         except BaseException:
             self._closed = True
@@ -377,6 +386,122 @@ class DatasetBindingManager:
                     pass
             raise
 
+    @classmethod
+    def from_bindings(cls, bindings: Iterable[TaskBinding], source_factory=None) -> "DatasetBindingManager":
+        """Restore saved jobs without source I/O; reopen only for a new task.
+
+        ``bindings`` must be nonempty and in the original allocation order, not
+        queue/task-ID order. Each binding must describe the same run and sources.
+        The original immutable objects are retained for existing-job retries.
+
+        The first new task reopens saved resolved specifications, checks their
+        fingerprints, then replays and verifies every committed row ID and mapped
+        value before advancing. A replay failure is latched for new allocations
+        while existing saved jobs remain usable. ``source_factory`` defaults to
+        :func:`dataset_sources.open_source` and is called with each saved spec.
+        """
+        if source_factory is not None and not callable(source_factory):
+            raise DatasetBindingError("Source factory must be callable.")
+        try:
+            ordered = tuple(bindings)
+        except TypeError as exc:
+            raise DatasetBindingError("Saved bindings must be an ordered iterable of TaskBinding objects.") from exc
+        if not ordered:
+            raise DatasetBindingError("Restoration requires at least one saved task binding.")
+        if any(not isinstance(binding, TaskBinding) for binding in ordered):
+            raise DatasetBindingError("Saved bindings must contain only TaskBinding objects.")
+        first = ordered[0]
+        seen = set()
+        for binding in ordered:
+            if binding.run_id != first.run_id:
+                raise DatasetBindingError("Saved task bindings must belong to the same run.")
+            if binding.task_id in seen:
+                raise DatasetBindingError("Duplicate saved task ID {!r}.".format(binding.task_id))
+            seen.add(binding.task_id)
+            if len(binding.sources) != len(first.sources):
+                raise DatasetBindingError("Saved task bindings must use the same ordered sources.")
+            for expected, actual in zip(first.sources, binding.sources):
+                if (actual.spec != expected.spec or actual.fingerprint != expected.fingerprint
+                        or actual.column_aliases != expected.column_aliases):
+                    raise DatasetBindingError(
+                        "Saved source specifications, fingerprints, mappings, and order must be consistent."
+                    )
+        manager = cls.__new__(cls)
+        manager.run_id = first.run_id
+        manager._lock = threading.Lock()
+        manager._closed = False
+        manager._bindings = {binding.task_id: binding for binding in ordered}
+        manager._cursors = []
+        manager._restore_bindings = ordered
+        manager._source_factory = open_source if source_factory is None else source_factory
+        manager._restore_failure = None
+        return manager
+
+    def _restore_cursors_locked(self) -> None:
+        """Rehydrate once under the allocation lock; never change saved bindings."""
+        if self._restore_failure is not None:
+            raise DatasetBindingError(self._restore_failure)
+        if self._restore_bindings is None:
+            return
+        readers = []
+        cursors = []
+        try:
+            for expected in self._restore_bindings[0].sources:
+                source = self._source_factory(expected.spec)
+                readers.append(source)
+                selection = SourceBinding(source, expected.column_aliases)
+                spec = _copy_spec(source.spec)
+                schema = source.schema()
+                spec = _validate_schema(spec, schema, selection.column_aliases)
+                if spec != expected.spec:
+                    raise DatasetBindingError(
+                        "Source {!r} resolved to different settings than its saved binding."
+                        .format(expected.spec.source_id)
+                    )
+                if schema.fingerprint != expected.fingerprint:
+                    raise DatasetBindingError(
+                        "Source {!r} fingerprint differs from its saved binding."
+                        .format(expected.spec.source_id)
+                    )
+                cursors.append(_SourceCursor(selection, spec, schema))
+            for binding in self._restore_bindings:
+                for cursor, saved in zip(cursors, binding.sources):
+                    row_id, values = cursor.peek()
+                    if row_id != saved.row_id:
+                        raise DatasetBindingError(
+                            "Source {!r} does not reproduce saved row {!r} for task {!r}."
+                            .format(cursor.spec.source_id, saved.row_id, binding.task_id)
+                        )
+                    expected_values = {alias: binding.values[alias]
+                                       for alias in saved.column_aliases.values()}
+                    if values != expected_values:
+                        raise DatasetBindingError(
+                            "Source {!r} does not reproduce saved mapped values for task {!r}, row {!r}."
+                            .format(cursor.spec.source_id, binding.task_id, saved.row_id)
+                        )
+                for cursor in cursors:
+                    cursor.commit()
+        except BaseException as exc:
+            for cursor in reversed(cursors):
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            for source in reversed(readers):
+                try:
+                    close_source = getattr(source, "close", None)
+                    if close_source is not None:
+                        close_source()
+                except Exception:
+                    pass
+            self._restore_failure = "Cannot resume dataset row allocation: {}".format(exc)
+            if isinstance(exc, Exception):
+                raise DatasetBindingError(self._restore_failure) from exc
+            raise
+        self._cursors = cursors
+        self._restore_bindings = None
+        self._source_factory = None
+
     def bind(self, task_id: str) -> TaskBinding:
         """Return the original binding, or atomically allocate the next source rows."""
         _text_identifier(task_id, "Task ID")
@@ -385,6 +510,7 @@ class DatasetBindingManager:
                 return self._bindings[task_id]
             if self._closed:
                 raise DatasetBindingError("Dataset binding manager is closed; no new tasks can be bound.")
+            self._restore_cursors_locked()
             values = {}
             provenance = []
             for cursor in self._cursors:

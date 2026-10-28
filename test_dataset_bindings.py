@@ -6,16 +6,19 @@ worker/retry integration tests belong to the later wiring milestone.
 
 import json
 import math
+from pathlib import Path
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+from unittest.mock import Mock
 
 from dataset_bindings import (
     DatasetBindingError, DatasetBindingManager, DatasetExhaustedError,
     SourceBinding, TaskBinding, cell_to_text,
 )
-from dataset_sources import DatasetRow, DatasetSchema, SourceSpec
+from dataset_sources import DatasetRow, DatasetSchema, SourceSpec, open_source
 
 
 class MemorySource:
@@ -391,6 +394,205 @@ class CellTextTests(unittest.TestCase):
         for value in (object(), b"bytes", (1, 2), {1: "numeric key"}, {"set"}, math.nan, math.inf, cyclic):
             with self.subTest(type=type(value).__name__), self.assertRaises(DatasetBindingError):
                 cell_to_text(value)
+
+
+class TrackingRestoreSource(MemorySource):
+    """Replay fixture with observable reader and iterator cleanup."""
+
+    def __init__(self, source_id, rows):
+        super().__init__(source_id, ("v",), rows)
+        self.close_count = 0
+        self.iterator_closed = False
+
+    def iter_rows(self):
+        try:
+            yield from super().iter_rows()
+        finally:
+            self.iterator_closed = True
+
+    def close(self):
+        self.close_count += 1
+
+
+class RestorationTests(unittest.TestCase):
+    def saved_bindings(self, count=2, row_count=24):
+        rows = [{"v": "value-{}".format(index)} for index in range(row_count)]
+        source = MemorySource("rows", ("v",), rows)
+        with DatasetBindingManager("run", [SourceBinding(source, {"v": "value"})]) as manager:
+            saved = tuple(manager.bind("old-{}".format(index)) for index in range(count))
+        return saved, rows
+
+    def local_bindings(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "records.csv"
+        path.write_text("v\nfirst\n\nsecond\nthird\n", encoding="utf-8")
+        source = open_source(SourceSpec("local", "csv", str(path)))
+        with DatasetBindingManager("run", [SourceBinding(source, {"v": "value"})]) as manager:
+            saved = (manager.bind("first-job"), manager.bind("second-job"))
+        return path, saved
+
+    def test_existing_bindings_and_close_never_open_sources(self):
+        saved, _ = self.saved_bindings()
+        factory = Mock(side_effect=AssertionError("Unexpected source I/O"))
+        restored = DatasetBindingManager.from_bindings(saved, source_factory=factory)
+        self.assertEqual(restored.snapshot(), saved)
+        self.assertIs(restored.bind(saved[0].task_id), saved[0])
+        self.assertIs(restored.get(saved[1].task_id), saved[1])
+        restored.close()
+        self.assertIs(restored.bind(saved[1].task_id), saved[1])
+        with self.assertRaisesRegex(DatasetBindingError, "closed"):
+            restored.bind("new-job")
+        factory.assert_not_called()
+
+    def test_real_csv_restore_replays_rows_instead_of_seeking_numeric_row_ids(self):
+        _, saved = self.local_bindings()
+        self.assertEqual([binding.sources[0].row_id for binding in saved], ["0", "2"])
+        with DatasetBindingManager.from_bindings(saved) as restored:
+            self.assertIs(restored.bind("first-job"), saved[0])
+            next_binding = restored.bind("new-job")
+            self.assertEqual(next_binding.values["value"], "third")
+            self.assertEqual(next_binding.sources[0].row_id, "3")
+            self.assertEqual(restored.snapshot(), saved + (next_binding,))
+
+    def test_restoration_passes_saved_pinned_hub_spec_to_factory(self):
+        resolved = SourceSpec("hub", "huggingface", "owner/data", "subset", "train", "a" * 40)
+        rows = [{"v": "saved"}, {"v": "next"}]
+
+        class PinnedSource(MemorySource):
+            def schema(self):
+                return DatasetSchema(self.columns, "fixture-hub", resolved)
+
+        source = PinnedSource("hub", ("v",), rows)
+        source.spec = SourceSpec("hub", "huggingface", "owner/data", revision="main")
+        with DatasetBindingManager("run", [SourceBinding(source, {"v": "value"})]) as manager:
+            saved = (manager.bind("old"),)
+
+        def reopen(spec):
+            reader = MemorySource("hub", ("v",), rows)
+            reader.spec = spec
+            return reader
+
+        factory = Mock(side_effect=reopen)
+        with DatasetBindingManager.from_bindings(saved, factory) as restored:
+            self.assertEqual(restored.bind("new").values["value"], "next")
+        factory.assert_called_once_with(resolved)
+
+    def test_changed_or_absent_local_source_latches_error_without_losing_saved_jobs(self):
+        for absent in (False, True):
+            with self.subTest(absent=absent):
+                path, saved = self.local_bindings()
+                if absent:
+                    path.unlink()
+                else:
+                    path.write_text("v\nchanged-and-longer\nsecond\nthird\n", encoding="utf-8")
+                factory = Mock(side_effect=open_source)
+                with DatasetBindingManager.from_bindings(saved, factory) as restored:
+                    self.assertIs(restored.bind(saved[0].task_id), saved[0])
+                    for task_id in ("new-a", "new-b"):
+                        with self.assertRaisesRegex(DatasetBindingError, "Cannot resume dataset row allocation"):
+                            restored.bind(task_id)
+                    self.assertIs(restored.bind(saved[1].task_id), saved[1])
+                    self.assertEqual(restored.snapshot(), saved)
+                self.assertEqual(factory.call_count, 1)
+
+    def test_same_fingerprint_reordered_or_shortened_sources_are_rejected(self):
+        saved, rows = self.saved_bindings()
+        for changed_rows, message in ((list(reversed(rows)), "saved mapped values"), (rows[:1], "exhausted")):
+            with self.subTest(message=message):
+                source = TrackingRestoreSource("rows", changed_rows)
+                factory = Mock(return_value=source)
+                with DatasetBindingManager.from_bindings(saved, factory) as restored:
+                    for task_id in ("new-a", "new-b"):
+                        with self.assertRaisesRegex(DatasetBindingError, message):
+                            restored.bind(task_id)
+                    self.assertIs(restored.bind(saved[0].task_id), saved[0])
+                    self.assertEqual(restored.snapshot(), saved)
+                self.assertEqual(source.close_count, 1)
+                self.assertTrue(source.iterator_closed)
+                self.assertEqual(source.read_count, 1)
+                factory.assert_called_once()
+
+    def test_wrong_allocation_order_fails_row_identity_verification(self):
+        saved, rows = self.saved_bindings()
+        source = TrackingRestoreSource("rows", rows)
+        with DatasetBindingManager.from_bindings(reversed(saved), lambda spec: source) as restored:
+            with self.assertRaisesRegex(DatasetBindingError, "saved row"):
+                restored.bind("new")
+            self.assertIs(restored.bind(saved[0].task_id), saved[0])
+        self.assertTrue(source.iterator_closed)
+        self.assertEqual(source.close_count, 1)
+
+    def test_inconsistent_saved_metadata_is_rejected_without_io(self):
+        saved, _ = self.saved_bindings()
+        source = saved[1].sources[0]
+        invalid = [
+            (),
+            (saved[0], saved[0]),
+            (saved[0], replace(saved[1], run_id="another-run")),
+            (saved[0], replace(saved[1], sources=(replace(source, fingerprint="changed"),))),
+            (saved[0], replace(saved[1], sources=(replace(source, spec=SourceSpec("rows", "csv", "elsewhere.csv")),))),
+            (saved[0], replace(saved[1], sources=(replace(source, column_aliases={"other": "value"}),))),
+            (saved[0], replace(saved[1], values={}, sources=())),
+            (object(),),
+        ]
+        factory = Mock(side_effect=AssertionError("Validation performed source I/O"))
+        for bindings in invalid:
+            with self.subTest(bindings=bindings), self.assertRaises(DatasetBindingError):
+                DatasetBindingManager.from_bindings(bindings, factory)
+        factory.assert_not_called()
+
+    def test_twenty_new_tasks_share_one_rehydration_and_correct_next_positions(self):
+        saved, rows = self.saved_bindings()
+        source = TrackingRestoreSource("rows", rows)
+        factory = Mock(return_value=source)
+        barrier = threading.Barrier(20)
+        with DatasetBindingManager.from_bindings(saved, factory) as restored:
+            def bind(index):
+                barrier.wait(timeout=10)
+                return restored.bind("new-{}".format(index))
+
+            with ThreadPoolExecutor(max_workers=20) as pool:
+                results = list(pool.map(bind, range(20)))
+            self.assertEqual({binding.values["value"] for binding in results},
+                             {"value-{}".format(index) for index in range(2, 22)})
+            self.assertEqual({binding.sources[0].row_id for binding in results},
+                             {str(index) for index in range(2, 22)})
+            self.assertEqual(len(restored.snapshot()), 22)
+            self.assertIs(restored.bind(saved[0].task_id), saved[0])
+            self.assertEqual(source.read_count, 22)
+        factory.assert_called_once()
+        self.assertEqual(source.close_count, 1)
+        self.assertTrue(source.iterator_closed)
+
+    def test_replay_failure_closes_all_readers_even_when_cleanup_fails(self):
+        first_rows = [{"v": "a0"}, {"v": "a1"}]
+        second_rows = [{"v": "b0"}, {"v": "b1"}]
+        first = MemorySource("first", ("v",), first_rows)
+        second = MemorySource("second", ("v",), second_rows)
+        with DatasetBindingManager("run", [
+            SourceBinding(first, {"v": "left"}), SourceBinding(second, {"v": "right"}),
+        ]) as manager:
+            saved = (manager.bind("old"),)
+
+        class BadCloseSource(TrackingRestoreSource):
+            def close(self):
+                super().close()
+                raise OSError("secondary close error")
+
+        opened = {
+            "first": BadCloseSource("first", first_rows),
+            "second": TrackingRestoreSource("second", [{"v": "wrong"}]),
+        }
+        factory = Mock(side_effect=lambda spec: opened[spec.source_id])
+        with DatasetBindingManager.from_bindings(saved, factory) as restored:
+            with self.assertRaisesRegex(DatasetBindingError, "saved mapped values"):
+                restored.bind("new")
+            self.assertIs(restored.bind("old"), saved[0])
+        for source in opened.values():
+            self.assertTrue(source.iterator_closed)
+            self.assertEqual(source.close_count, 1)
+        self.assertEqual(factory.call_count, 2)
 
 
 if __name__ == "__main__":

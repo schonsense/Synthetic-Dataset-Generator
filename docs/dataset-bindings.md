@@ -1,14 +1,10 @@
 # Dataset bindings: sources, configuration, and validation
 
-This branch adds an isolated dataset-source foundation and a **Datasets** tab in
-the Configuration Editor. Step 3 includes source metadata discovery, column-to-alias
-mapping, visibility filtering, and configuration/profile persistence. The default
-configuration has `datasets: {sources: []}`.
-
-Generation does not consume these settings yet. Job binding, prompt rendering,
-and application recovery still need their separate worker integration; entering a
-dataset placeholder in a production generation prompt is not supported at this
-checkpoint.
+This branch adds dataset sources, a **Datasets** configuration tab, and generation
+worker integration. Configured aliases can be inserted into authored prompt fields
+as `{{ds:alias}}`. Each logical job keeps its assigned rows through subsequent turns,
+cleanup calls, API duplication, retries, and recovery. The default configuration
+has `datasets: {sources: []}` and uses the existing prompt-generation path.
 
 ## Datasets tab
 
@@ -23,6 +19,9 @@ checkpoint.
    unmapped. Aliases must be unique among enabled sources.
 5. Save through **Save to config.yml** or a named profile. Source definitions,
    imported names, aliases, and visibility choices survive reloads.
+6. Insert the copied placeholders into the relevant prompt fields and start a
+   generation run. The existing questions, random-chunk, and opening-mode queue
+   controls still determine how many jobs are created.
 
 ### Many-column layout and visibility
 
@@ -78,10 +77,29 @@ and malformed reserved placeholders are errors. Unrelated braces, JSON, pipes,
 and tags are preserved. There is no escape syntax for a literal dataset token
 in an authored template at this stage; such tokens in inserted values are literal.
 
-Rendering must happen at the point where a stage has both its native values and
-the job's dataset binding. Do not run old `.replace()` passes afterward, and do
-not treat generated text or conversation history as templates. The eventual
-integration must preserve existing behavior on the no-datasets path.
+Rendering happens where a stage has both its native values and the job's dataset
+binding. With datasets active, native and dataset placeholders are substituted in
+one pass; generated text and conversation history never become templates. With
+no active dataset mappings, the original replacement behavior is retained.
+
+Supported authored fields include system variations, top-level system text, lore,
+selected character text fields, random names, emotional-state entries, question
+and answer instructions, user continuations, opening greetings/context/first-line
+styles, and configured rewrite instructions. Quality scoring consumes the resulting
+conversation literally. Questions-file entries and source-file chunks also remain
+literal inputs; use the configured prompt fields for dataset placeholders.
+
+For example, map `first_name` to `person_name` in one source and `location` to
+`scene_place` in another, then use:
+
+```text
+Write about {{ds:person_name}} arriving at {{ds:scene_place}}.
+Use this existing source context: {context}
+```
+
+Every mapped field from the first source comes from one person row. Every mapped
+field from the second comes from one location row. A later cleanup or continuation
+request for that job uses the same pair.
 
 ## Source interface
 
@@ -169,11 +187,67 @@ preserved. Nulls inside JSON stay `null`; booleans become `true`/`false`.
 Non-finite numbers and Python-only objects fail rather than using their repr.
 
 `TaskBinding.to_dict()` stores actual mapped strings, mappings, row IDs, and source
-provenance. `from_dict()` restores that binding without reading sources. This
-does not yet restore the application's pending jobs, source cursor positions,
-or conversations. The application's existing saved-state mechanism still needs
-explicit integration. `manager.close()` releases readers while keeping existing
-bindings readable; new allocations are then prohibited.
+provenance. `from_dict()` restores that binding without reading sources.
+`DatasetBindingManager.from_bindings()` accepts bindings in their original
+allocation order. Existing jobs immediately reuse their saved values. The first
+new allocation reopens the saved resolved sources, requires matching fingerprints,
+and replays every committed row ID and mapped value before advancing. It never
+seeks by numeric row ID: formats can skip physical rows.
+
+`manager.close()` releases readers while keeping existing bindings readable;
+new allocations are then prohibited.
+
+## Run persistence and lifecycle
+
+`dataset_runtime.DatasetRun` owns the frozen dataset settings, original queued
+task tuples, and durable bindings for one run. Workers receive that particular
+runtime as an argument. They do not look up a replaceable global row or infer
+ownership from an API slot. Each newly queued dataset job gets a run ID plus a
+unique ordinal, even when two original input samples happen to be identical.
+
+Rows are allocated sequentially in binding order, which can differ from queue
+order when workers run concurrently. Allocation and checkpoint writes are
+serialized; prompt construction and model calls take place after that lock is
+released. Repeated allocation calls for a job return its original immutable values.
+
+Before workers start, the tool seals a manifest containing the original job inputs
+and frozen source settings. Before a job's first request, it atomically saves that
+job's mapped values and source provenance. Only mapped dataset values are retained.
+Records live under `output/dataset_runs/<run_id>/`; the usual
+`output/generation_state.json` contains a small reference and current job statuses.
+The manifest is written once and each binding has its own file, avoiding repeated
+rewrites of all input passages as jobs finish.
+
+Binding records carry allocation order and checksums; a small allocation frontier
+detects missing committed records. Recovery can adopt one complete record left by
+an interruption immediately before its frontier update, after validating it.
+Incomplete or inconsistent checkpoints fail explicitly. These files contain the
+actual inputs and mapped dataset values and belong with the run's other output.
+API credentials are not included in the dataset checkpoint.
+
+On restart, the saved job catalog supplies the original inputs. Already-bound jobs
+can run even if their original input files or dataset sources are unavailable.
+Assigning a row to a previously unbound job requires successful source replay and
+verification. A missing, changed, exhausted, or malformed source prevents new
+assignments; already-bound jobs retain usable values and can finish.
+
+Settings edits during a run do not replace its dataset mappings. Resuming requires
+matching active source settings, aliases, and the saved critical run settings;
+GUI-only name/visibility changes are allowed. Invalid recovery state is preserved
+and blocks saving over it. Restore the matching settings or use the explicit
+**Stop & Clear Job** action to start a new run. Stop & Clear removes the loaded
+run's dataset checkpoints after its workers exit. Other run directories are
+retained, including an older directory whose checkpoint could not be loaded.
+
+Completion and shutdown retain references to the actual workers until they exit.
+Starting a replacement run is blocked while old workers or cleanup remain active.
+Manual retry resets retry counts and keeps the original job payload and binding.
+
+Recovery restarts an unfinished conversation from its first request. It does not
+resume inside a model request or a partially completed conversation, and does not
+make output writes transactional. In duplication mode, a partially successful job
+is marked failed while already-written per-API outputs remain; explicitly retrying
+it can repeat those outputs. Fully successful duplicated jobs are marked completed.
 
 ## Optional dependencies and compatibility boundary
 
@@ -307,7 +381,41 @@ Visual review caught missing Unicode checkbox glyphs; the dropdown now uses the
 portable markers shown above. No model API calls were used for these checks.
 Windows hands-on verification remains outstanding.
 
-The next implementation boundary is the generation worker: stable queued-job IDs,
-one source-row binding per logical job, stage-specific rendering, and persisted
-bindings plus original job payloads. The GUI and source modules are now ready for
-that integration, but these production hooks remain unwired.
+### Step 4 worker integration evidence (2026-10-28)
+
+The production-path checks use the actual generation worker, request builders,
+rewrite loops, output writer, local dataset sources, and durable runtime. HTTP
+responses are simulated; cache access, rate limiting, and timing boundaries are
+controlled by the existing test harness. No paid model requests are used.
+
+The final isolated Linux/Python 3.12 pass completed with no skips:
+
+| Suite | Result |
+| --- | --- |
+| Sources, bindings/restoration, templates, settings, pipeline simulation, real optional backends, durable runtime | 112 tests passed |
+| Production generation worker and request paths | 11 tests passed |
+| Application startup, recovery, retry, and shutdown lifecycle | 25 tests passed |
+| Existing API-profile, persona/arc, and opening-mode regression scripts | All passed |
+
+That is 148 non-GUI dataset tests at this checkpoint. The 14 real Tk tests and
+screenshots in Step 3 cover the unchanged Datasets panel and column picker.
+
+Run the production-worker and lifecycle suites in separate processes because the
+existing generation harness installs module-level mocks and a temporary working
+directory:
+
+```sh
+python -B -m unittest test_dataset_runtime
+python -B test_dataset_generation.py
+python -B -m unittest test_dataset_lifecycle
+```
+
+The runtime checks cover concurrent assignment, source-free retries, verified next
+row recovery, write failure, record integrity, interruption recovery, and precise
+checkpoint cleanup. The worker checks exercise twenty simultaneous jobs, multiple
+turns and rewrite passes, HTTP/whole-job retries, literal inserted text, previews
+and cache inputs, opening/character prompts, API duplication, and source exhaustion
+while already-bound work remains in flight. Lifecycle checks exercise actual
+application functions with GUI handles replaced by test stand-ins.
+
+Windows hands-on verification remains the next review gate before an upstream PR.
