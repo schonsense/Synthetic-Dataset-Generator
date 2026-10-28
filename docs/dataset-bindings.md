@@ -1,13 +1,71 @@
-# Dataset bindings: foundation and validation
+# Dataset bindings: sources, configuration, and validation
 
-This is an isolated foundation on `feature/dataset-bindings`, with Step 2 reader,
-dependency, and orchestration validation completed. The application does not
-import these modules yet. There is no new GUI, generation behavior, configuration
-key, or automatic application resume at this checkpoint.
+This branch adds an isolated dataset-source foundation and a **Datasets** tab in
+the Configuration Editor. Step 3 includes source metadata discovery, column-to-alias
+mapping, visibility filtering, and configuration/profile persistence. The default
+configuration has `datasets: {sources: []}`.
+
+Generation does not consume these settings yet. Job binding, prompt rendering,
+and application recovery still need their separate worker integration; entering a
+dataset placeholder in a production generation prompt is not supported at this
+checkpoint.
+
+## Datasets tab
+
+1. Open the Configuration Editor and select **Datasets**. Use **Add** for each
+   source. The source selector keeps the layout bounded as more sources are added.
+2. Choose the source type and location. Hub sources also expose configuration,
+   split, and revision; a saved DatasetDict exposes its split selector.
+3. Choose **Import columns**. Metadata discovery runs in background workers.
+   The panel displays column names, aliases, and placeholders, never record cells.
+4. Select a column and enter an alias such as `record_key`. **Apply** saves it;
+   **Copy placeholder** copies `{{ds:record_key}}`. An empty alias leaves a column
+   unmapped. Aliases must be unique among enabled sources.
+5. Save through **Save to config.yml** or a named profile. Source definitions,
+   imported names, aliases, and visibility choices survive reloads.
+
+### Many-column layout and visibility
+
+The mapping table has a bounded viewport with vertical and horizontal scrollbars.
+It uses native rows and one selected-column editor, rather than a widget per
+column. Long column names remain available in the selected-column field.
+
+**Columns: All** is the default for each source. Its dropdown has a bounded,
+scrollable list, individual toggles, a search field, and an **All** control.
+The markers `[x]` and `[ ]` use plain characters so selection remains visible
+even when a system font lacks checkbox symbols. Mouse clicks and Space toggle
+rows; Escape or clicking outside dismisses the menu.
+
+Search only filters the dropdown list. It does not change selections, and **All**
+applies to the entire schema. Hiding a column preserves its alias and keeps that
+mapping active. Each source retains its own visibility settings. All also includes
+new names imported later; an explicit partial selection retains its surviving
+names after refresh.
+
+![Column picker with 1,000 imported column names](images/datasets-columns-menu.png)
+
+![Datasets tab at a 760 by 520 client size](images/datasets-small-window.png)
+
+These are captures of the actual editor under a Linux virtual display. Fonts,
+window decorations, and native control rendering can differ on Windows.
+
+### Drafts, refresh, and saving
+
+Disabled sources and sources with no aliases may be saved as unfinished drafts.
+Enabled sources with mappings require an imported schema matching the current
+location/config/split/revision settings. Editing those selectors requires another
+import before saving active mappings. A refresh that would remove a mapped column
+is rejected; clear that alias in the retained table before retrying.
+
+Both main-configuration and profile saves validate these rules. If autosave on
+window close fails, the editor stays open with the validation message and all
+unsaved changes preserved. Loading or saving settings performs no dataset I/O.
+Pending metadata results are discarded after changing selectors, switching or
+removing sources, reloading settings, or closing the panel.
 
 ## Placeholder syntax
 
-Use `{{ds:alias}}`, for example `{{ds:nvd_f_name}}`. The future GUI will store the
+Use `{{ds:alias}}`, for example `{{ds:nvd_f_name}}`. The GUI stores the
 alias alone (`nvd_f_name`), independently of the exact source column name.
 Aliases are case-sensitive and match `[A-Za-z_][A-Za-z0-9_]*`. They must be unique
 across the sources used in a run.
@@ -41,7 +99,7 @@ integration must preserve existing behavior on the no-datasets path.
 
 Creating a source opens nothing. `source.schema()` returns column names and
 metadata, never row values. JSON key discovery must read the file, but does not
-retain values in the returned schema. It should run off the GUI thread later.
+retain values in the returned schema. The panel runs discovery off the GUI thread.
 The file readers handle exact top-level column names; dotted names are literal
 columns, not nested field paths. Nested JSON cells serialize as JSON when bound.
 
@@ -159,7 +217,7 @@ Primary API references:
 Run the dependency-free foundation checks with:
 
 ```sh
-python -B -m unittest test_dataset_sources test_dataset_bindings test_dataset_templates test_dataset_pipeline
+python -B -m unittest test_dataset_sources test_dataset_bindings test_dataset_templates test_dataset_settings test_dataset_pipeline
 ```
 
 After installing the optional requirements, also run the real local backend tests:
@@ -213,6 +271,43 @@ those hooks are not wired yet. Existing regression scripts exercise the current
 worker independently. No paid model calls, GUI interaction, Windows execution,
 repository push, or PR was part of this validation checkpoint.
 
-Next is the isolated Datasets panel with background schema discovery. Application
-configuration, worker/rendering hooks, unique queued-job IDs, and persisted
-bindings plus original job payloads remain subsequent integration work.
+### Step 3 evidence (2026-10-28)
+
+All 89 non-GUI dataset tests passed, including 21 settings tests and the optional
+local backends, with no skips. The existing API-profile, persona/arc, and
+opening-mode scripts also passed: 28, 45, and 179 checks respectively.
+
+Run the actual Tk GUI suites separately with the normal application dependencies
+and a desktop or virtual display:
+
+```sh
+python -B -m unittest test_dataset_column_menu
+python -B -m unittest test_datasets_panel
+```
+
+All seven dropdown tests and all seven panel/editor tests passed with no skips.
+Together with the non-GUI suites, that is 103 dataset tests. The GUI checks used
+Linux, Python 3.12.14, Tk 9.0.4, and ttkbootstrap 2.2.6. They exercised:
+
+- 1,000 columns, including very long names, with constant widget counts and
+  bounded table/dropdown geometry. The full editor was checked at 760 by 520 and
+  1366 by 700 client sizes; 32 sources were added and retained in the panel.
+- All/partial/empty visibility, search, mouse and keyboard toggles, focus/grab
+  restoration, menu dismissal, and source-specific visibility persistence.
+- Background CSV metadata discovery with a responsive Tk event loop, reader
+  closure, no row iteration requested by the GUI, and no record cells in settings.
+- Late/out-of-order results, source switching/removal, settings reload, and panel
+  destruction while metadata requests were outstanding.
+- Exact placeholder copying, hidden alias retention, schema refresh rejection,
+  actual profile save/load, main configuration save, and preservation of unsaved
+  changes when validation blocks window-close autosave. Disabled drafts save intact.
+
+`READYART_GUI_SCREENSHOTS` optionally gives the panel suite a screenshot directory.
+Visual review caught missing Unicode checkbox glyphs; the dropdown now uses the
+portable markers shown above. No model API calls were used for these checks.
+Windows hands-on verification remains outstanding.
+
+The next implementation boundary is the generation worker: stable queued-job IDs,
+one source-row binding per logical job, stage-specific rendering, and persisted
+bindings plus original job payloads. The GUI and source modules are now ready for
+that integration, but these production hooks remain unwired.
