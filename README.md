@@ -230,7 +230,7 @@ A powerful, multi-threaded GUI application for generating high-quality synthetic
 Install via `pip install -r requirements.txt`:
 
 ```
-requests==2.31.0
+requests>=2.32.4,<3
 python-dotenv==1.0.0
 PyYAML==6.0.1
 tk==0.1.0

@@ -363,7 +363,8 @@ OPENING_HISTORY = [a("The lamp gutters. \"Close the door,\" she says."), u("I sh
 def test_write_conversation():
     reset_state()
     plain = [u("Hello there."), a("Hello back.")]
-    write(plain, task_id="plain")
+    # This fixture checks the legacy format; metadata is now on by default.
+    write(plain, task_id="plain", include_metadata=False)
     with open(os.path.join("output", "output.jsonl"), encoding="utf-8") as f:
         text = f.read()
     expected = json.dumps({"id": "plain", "conversations": [{"from": "human", "value": "Hello there."},
